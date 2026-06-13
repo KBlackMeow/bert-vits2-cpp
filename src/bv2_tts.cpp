@@ -2,6 +2,7 @@
 #include "bv2_openjtalk.h"
 #include "bv2_sentencepiece.h"
 #include "bv2_text_internal.h"
+#include "bv2_zh_frontend.h"
 
 #include <algorithm>
 #include <array>
@@ -100,10 +101,31 @@ bool file_exists(const std::string & path) {
 }
 
 std::string first_existing_path(std::initializer_list<const char *> paths) {
+    static std::mutex mutex;
+    static std::map<std::string, std::string> cache;
+    std::string key;
     for (const char * path : paths) {
-        if (file_exists(path)) return path;
+        if (!key.empty()) key += '\0';
+        key += path ? path : "";
     }
-    throw std::runtime_error("required frontend asset was not found");
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+    }
+    for (const char * path : paths) {
+        if (file_exists(path)) {
+            std::lock_guard<std::mutex> lock(mutex);
+            cache[key] = path;
+            return path;
+        }
+    }
+    std::string tried;
+    for (const char * path : paths) {
+        if (!tried.empty()) tried += ", ";
+        tried += path;
+    }
+    throw std::runtime_error("required frontend asset was not found; tried: " + tried);
 }
 
 std::vector<int64_t> parse_i64_csv(const std::string & csv) {
@@ -156,9 +178,12 @@ const std::map<std::string, std::vector<std::string>> & zh_pinyin_to_symbols() {
     std::ifstream in(path);
     std::string line;
     while (std::getline(in, line)) {
-        const size_t tab = line.find('\t');
-        if (tab == std::string::npos) continue;
-        table[line.substr(0, tab)] = split_ws(line.substr(tab + 1));
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        size_t sep = line.find('\t');
+        if (sep == std::string::npos) sep = line.find(' ');
+        if (sep == std::string::npos || sep == 0) continue;
+        table[line.substr(0, sep)] = split_ws(line.substr(sep + 1));
     }
     return table;
 }
@@ -178,11 +203,39 @@ std::vector<std::string> utf8_chars(const std::string & text) {
     return chars;
 }
 
-std::string normalize_pinyin_base(std::string base) {
-    if (base == "uei") return "ui";
-    if (base == "iou") return "iu";
-    if (base == "uen") return "un";
-    return base;
+uint32_t utf8_codepoint(const std::string & ch) {
+    const unsigned char c0 = static_cast<unsigned char>(ch[0]);
+    if (c0 < 0x80) return c0;
+    if ((c0 & 0xE0) == 0xC0 && ch.size() >= 2) {
+        return ((c0 & 0x1F) << 6) | (static_cast<unsigned char>(ch[1]) & 0x3F);
+    }
+    if ((c0 & 0xF0) == 0xE0 && ch.size() >= 3) {
+        return ((c0 & 0x0F) << 12)
+            | ((static_cast<unsigned char>(ch[1]) & 0x3F) << 6)
+            | (static_cast<unsigned char>(ch[2]) & 0x3F);
+    }
+    if ((c0 & 0xF8) == 0xF0 && ch.size() >= 4) {
+        return ((c0 & 0x07) << 18)
+            | ((static_cast<unsigned char>(ch[1]) & 0x3F) << 12)
+            | ((static_cast<unsigned char>(ch[2]) & 0x3F) << 6)
+            | (static_cast<unsigned char>(ch[3]) & 0x3F);
+    }
+    return c0;
+}
+
+bool is_kana_char(const std::string & ch) {
+    const uint32_t cp = utf8_codepoint(ch);
+    return (cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x31F0 && cp <= 0x31FF);
+}
+
+bool is_cjk_char(const std::string & ch) {
+    const uint32_t cp = utf8_codepoint(ch);
+    return cp >= 0x4E00 && cp <= 0x9FFF;
+}
+
+bool is_ascii_letter_char(const std::string & ch) {
+    return ch.size() == 1
+        && ((ch[0] >= 'A' && ch[0] <= 'Z') || (ch[0] >= 'a' && ch[0] <= 'z'));
 }
 
 std::string punctuation_symbol(const std::string & ch) {
@@ -360,6 +413,38 @@ static bool is_char_nian(const std::string & text, size_t pos) {
         && static_cast<unsigned char>(text[pos + 2]) == 0xB4;
 }
 
+static size_t percent_sign_byte_length(const std::string & text, size_t pos) {
+    if (pos >= text.size()) return 0;
+    if (text[pos] == '%') return 1;
+    // UTF-8 U+FF05 FULLWIDTH PERCENT SIGN
+    if (pos + 2 < text.size()
+        && static_cast<unsigned char>(text[pos]) == 0xEF
+        && static_cast<unsigned char>(text[pos + 1]) == 0xBC
+        && static_cast<unsigned char>(text[pos + 2]) == 0x85) {
+        return 3;
+    }
+    return 0;
+}
+
+std::string normalize_chinese_punctuation(std::string text) {
+    static const std::vector<std::pair<std::string, std::string>> rep = {
+        {"：", ","}, {"；", ","}, {"，", ","}, {"。", "."}, {"！", "!"}, {"？", "?"},
+        {"\n", "."}, {"·", ","}, {"、", ","}, {"...", "…"}, {"$", "."},
+        {"“", "'"}, {"”", "'"}, {"\"", "'"}, {"‘", "'"}, {"’", "'"},
+        {"（", "'"}, {"）", "'"}, {"(", "'"}, {")", "'"},
+        {"《", "'"}, {"》", "'"}, {"【", "'"}, {"】", "'"}, {"[", "'"}, {"]", "'"},
+        {"—", "-"}, {"～", "-"}, {"~", "-"}, {"「", "'"}, {"」", "'"},
+    };
+    for (const auto & item : rep) {
+        size_t pos = 0;
+        while ((pos = text.find(item.first, pos)) != std::string::npos) {
+            text.replace(pos, item.first.size(), item.second);
+            pos += item.second.size();
+        }
+    }
+    return text;
+}
+
 std::string normalize_chinese_numbers(const std::string & text) {
     std::string result;
     std::string digit_buf;
@@ -370,9 +455,16 @@ std::string normalize_chinese_numbers(const std::string & text) {
             ++i;
         } else {
             if (!digit_buf.empty()) {
-                bool is_year = is_char_nian(text, i);
-                result += digits_to_chinese_number(digit_buf, is_year);
+                const size_t pct_len = percent_sign_byte_length(text, i);
+                if (pct_len > 0) {
+                    result += "百分之" + digits_to_chinese_number(digit_buf);
+                    i += pct_len;
+                } else {
+                    const bool is_year = is_char_nian(text, i);
+                    result += digits_to_chinese_number(digit_buf, is_year);
+                }
                 digit_buf.clear();
+                if (pct_len > 0) continue;
             }
             size_t n = 1;
             if ((c & 0xE0) == 0xC0) n = 2;
@@ -444,95 +536,7 @@ std::string normalize_english_numbers(const std::string & text) {
 }
 
 TextFeatures zh_text_to_sequence(const std::string & text) {
-    const std::string normalized = normalize_chinese_numbers(normalize_date_formats(text));
-    TextFeatures raw;
-    raw.norm_text = normalized;
-    add_phone(raw, "_", 0, "ZH");
-    raw.word2ph.push_back(1);
-
-    const auto & char_to_pinyin = zh_pinyin_table();
-    const auto & pinyin_to_symbols = zh_pinyin_to_symbols();
-
-    for (const auto & ch : utf8_chars(normalized)) {
-        const std::string punct = punctuation_symbol(ch);
-        if (!punct.empty()) {
-            add_phone(raw, punct, 0, "ZH");
-            raw.bert_tokens.push_back(punct);
-            raw.word2ph.push_back(1);
-            continue;
-        }
-
-        // ASCII letters → rough pinyin approximation for mixed Chinese-English text
-        if (ch.size() == 1) {
-            const char c = ch[0];
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
-                static const char * letter_py[] = {
-                    "ei1", "bi4", "si1", "di4", "yi4", "ai2 fu2", "ji2",
-                    "ai2 qu3", "ai4", "jie2", "kai1", "ai2 er3", "ai2 mu2",
-                    "en1", "ou1", "pi1", "kiu1", "a4", "ai2 si1", "ti4",
-                    "you1", "wei2", "da2 bu4 liu2", "ai2 ke4 si1", "wai4", "zei2"
-                };
-                const char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                const int idx = lower - 'a';
-                if (idx >= 0 && idx < 26) {
-                    std::string py = letter_py[idx];
-                    int64_t tone = 5;
-                    if (!py.empty() && py.back() >= '1' && py.back() <= '5') {
-                        tone = py.back() - '0';
-                        py.pop_back();
-                    }
-                    // Handle multi-syllable letters like "ai2 fu2" → just use first syllable
-                    size_t space = py.find(' ');
-                    if (space != std::string::npos) py = py.substr(0, space);
-                    py = normalize_pinyin_base(py);
-                    const auto sym_it = pinyin_to_symbols.find(py);
-                    if (sym_it != pinyin_to_symbols.end()) {
-                        int64_t phone_count = 0;
-                        for (const std::string & symbol : sym_it->second) {
-                            add_phone(raw, symbol, tone, "ZH");
-                            ++phone_count;
-                        }
-                        raw.bert_tokens.push_back(ch);
-                        raw.word2ph.push_back(phone_count);
-                    }
-                }
-                continue;
-            }
-        }
-
-        const auto py_it = char_to_pinyin.find(ch);
-        if (py_it == char_to_pinyin.end()) {
-            continue;
-        }
-
-        std::string py = py_it->second;
-        int64_t tone = 5;
-        if (!py.empty() && py.back() >= '1' && py.back() <= '5') {
-            tone = py.back() - '0';
-            py.pop_back();
-        }
-        py = normalize_pinyin_base(py);
-
-        const auto sym_it = pinyin_to_symbols.find(py);
-        if (sym_it == pinyin_to_symbols.end()) {
-            add_phone(raw, "UNK", 0, "ZH");
-            raw.bert_tokens.push_back(ch);
-            raw.word2ph.push_back(1);
-            continue;
-        }
-
-        int64_t phone_count = 0;
-        for (const std::string & symbol : sym_it->second) {
-            add_phone(raw, symbol, tone, "ZH");
-            ++phone_count;
-        }
-        raw.bert_tokens.push_back(ch);
-        raw.word2ph.push_back(phone_count);
-    }
-
-    add_phone(raw, "_", 0, "ZH");
-    raw.word2ph.push_back(1);
-    return intersperse_blank(raw);
+    return zh::text_to_sequence(text);
 }
 
 std::vector<int64_t> distribute_phone(int64_t n_phone, int64_t n_word) {
@@ -779,13 +783,12 @@ TextFeatures jp_text_to_sequence(const std::string & text) {
 namespace {
 
 TextFeatures en_text_to_sequence(const std::string & text) {
-    SentencePieceTokenizer sp;
     const std::string spm_path = first_existing_path({
         "bert/deberta-v3-large/spm.model",
         "../bert/deberta-v3-large/spm.model",
         "../../bert/deberta-v3-large/spm.model",
     });
-    sp.load(spm_path);
+    const SentencePieceTokenizer & sp = cached_sentencepiece(spm_path);
 
     const std::string norm = normalize_english_numbers(normalize_english_text(text));
     const auto pieces = sp.encode_pieces(norm);
@@ -1053,6 +1056,8 @@ std::vector<Ort::Value> run_session(
     const std::vector<const char *> & input_names,
     std::vector<Ort::Value> inputs,
     const std::vector<const char *> & output_names) {
+    static std::mutex inference_mutex;
+    std::lock_guard<std::mutex> lock(inference_mutex);
     return session.Run(
         Ort::RunOptions{nullptr},
         input_names.data(),
@@ -1087,102 +1092,313 @@ const float & Tensor::operator()(int64_t a, int64_t b, int64_t c) const {
     return data[static_cast<size_t>((a * shape[1] + b) * shape[2] + c)];
 }
 
-std::vector<std::pair<std::string, std::string>> split_text_by_language(
-    const std::string & text, const std::string & primary_lang) {
-    std::vector<std::pair<std::string, std::string>> spans;
-    if (text.empty()) return spans;
+TextFeatures text_to_sequence(const std::string & text, const std::string & language);
 
-    const auto chars = utf8_chars(text);
-    std::string current_span;
-    std::string current_lang;
+namespace {
 
-    for (const auto & ch : chars) {
-        const unsigned char c0 = static_cast<unsigned char>(ch[0]);
-        std::string char_lang;
-        if (ch.size() >= 3 && c0 == 0xE3) {
-            const unsigned char c1 = static_cast<unsigned char>(ch[1]);
-            // Japanese: Hiragana U+3040–U+309F, Katakana U+30A0–U+30FF
-            if ((c1 == 0x81 && c0 == 0xE3) || (c1 == 0x82) || (c1 == 0x83 && c0 == 0xE3)) {
-                const uint32_t cp = ((c0 & 0x0F) << 12) | ((c1 & 0x3F) << 6) | (static_cast<unsigned char>(ch[2]) & 0x3F);
-                if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x31F0 && cp <= 0x31FF))
-                    char_lang = "JP";
+bool is_digit_char(const std::string & ch) {
+    return ch.size() == 1 && ch[0] >= '0' && ch[0] <= '9';
+}
+
+bool is_space_char(const std::string & ch) {
+    return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
+}
+
+bool is_sentence_break_char(
+    const std::string & ch,
+    const std::vector<std::string> & chars,
+    size_t index) {
+    if (ch == ".") {
+        const bool digit_before = index > 0 && is_digit_char(chars[index - 1]);
+        const bool digit_after = index + 1 < chars.size() && is_digit_char(chars[index + 1]);
+        return !(digit_before && digit_after);
+    }
+    return ch == "。" || ch == "！" || ch == "？" || ch == "!" || ch == "?" || ch == "；"
+        || ch == "\xEF\xBC\x81" || ch == "\xEF\xBC\x9F" || ch == "\xE3\x80\x82";
+}
+
+std::string trim_span_copy(const std::string & text) {
+    size_t begin = 0;
+    while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin]))) ++begin;
+    size_t end = text.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) --end;
+    return text.substr(begin, end - begin);
+}
+
+bool text_has_kana(const std::string & text) {
+    for (const std::string & ch : internal::utf8_chars(text)) {
+        if (internal::is_kana_char(ch)) return true;
+    }
+    return false;
+}
+
+bool text_has_cjk(const std::string & text) {
+    for (const std::string & ch : internal::utf8_chars(text)) {
+        if (internal::is_cjk_char(ch)) return true;
+    }
+    return false;
+}
+
+bool text_has_latin_letters(const std::string & text) {
+    for (const std::string & ch : internal::utf8_chars(text)) {
+        if (internal::is_ascii_letter_char(ch)) return true;
+    }
+    return false;
+}
+
+int count_substr_hits(const std::string & text, const std::vector<const char *> & markers, int weight) {
+    int score = 0;
+    for (const char * marker : markers) {
+        if (marker == nullptr || *marker == '\0') continue;
+        if (text.find(marker) != std::string::npos) score += weight;
+    }
+    return score;
+}
+
+std::string classify_zh_ja_grammar(const std::string & text, const std::string & fallback) {
+    static const std::vector<const char *> jp_markers = {
+        "です", "ます", "でした", "ません", "である", "から", "まで", "見込み", "見込",
+        "気温", "天気", "快晴", "曇", "東京", "今日", "明日", "昨日", "パーセント",
+        "セント", "による", "について", "ござい", "であり", "増える", "夕方", "午後",
+        "最低", "最高", "土曜", "日曜", "月曜", "火曜", "水曜", "木曜", "金曜",
+        "見て", "います", "おり", "かけて",
+    };
+    static const std::vector<const char *> zh_markers = {
+        "今天", "明天", "昨天", "天气", "晴朗", "气温", "湿度", "适合", "出门", "散步",
+        "北京", "伦敦", "上海", "星期六", "星期五", "星期四", "星期三", "星期二", "星期一", "星期日",
+        "已经", "因为", "所以", "正在", "我们", "你们", "他们", "什么", "怎么", "非常",
+    };
+    static const std::vector<const char *> zh_chars = {
+        "的", "了", "吗", "呢", "着", "过", "很", "哪", "那", "这", "与", "及",
+    };
+    static const std::vector<const char *> jp_chars = {
+        "の", "を", "が", "は", "も", "へ", "と", "や", "ね", "よ", "ば", "か",
+    };
+
+    int jp_score = count_substr_hits(text, jp_markers, 3);
+    int zh_score = count_substr_hits(text, zh_markers, 3);
+    if (text.find("、") != std::string::npos) jp_score += 2;
+    if (text.find("，") != std::string::npos) zh_score += 2;
+    for (const char * ch : jp_chars) {
+        if (text.find(ch) != std::string::npos) jp_score += 1;
+    }
+    for (const char * ch : zh_chars) {
+        if (text.find(ch) != std::string::npos) zh_score += 2;
+    }
+    for (const std::string & ch : internal::utf8_chars(text)) {
+        if (internal::is_kana_char(ch)) jp_score += 3;
+    }
+    if (jp_score == zh_score) return fallback;
+    return jp_score > zh_score ? "JP" : "ZH";
+}
+
+std::string classify_sentence_language_impl(const std::string & sentence, const std::string & fallback) {
+    const std::string trimmed = trim_span_copy(sentence);
+    if (trimmed.empty()) return fallback;
+
+    if (text_has_kana(trimmed)) return "JP";
+    if (text_has_latin_letters(trimmed) && !text_has_cjk(trimmed)) return "EN";
+    if (text_has_cjk(trimmed) && !text_has_latin_letters(trimmed)) {
+        return classify_zh_ja_grammar(trimmed, fallback);
+    }
+    return fallback;
+}
+
+std::vector<std::string> split_sentences(const std::string & text) {
+    std::vector<std::string> sentences;
+    const auto chars = internal::utf8_chars(text);
+    size_t sent_begin = 0;
+    size_t byte_pos = 0;
+    for (size_t i = 0; i < chars.size(); ++i) {
+        byte_pos += chars[i].size();
+        if (!is_sentence_break_char(chars[i], chars, i)) continue;
+        const std::string sentence = text.substr(sent_begin, byte_pos - sent_begin);
+        if (!trim_span_copy(sentence).empty()) sentences.push_back(sentence);
+        sent_begin = byte_pos;
+    }
+    if (sent_begin < text.size()) {
+        const std::string tail = text.substr(sent_begin);
+        if (!trim_span_copy(tail).empty()) sentences.push_back(tail);
+    }
+    if (sentences.empty() && !trim_span_copy(text).empty()) sentences.push_back(text);
+    return sentences;
+}
+
+enum class ScriptBlock { None, Latin, EastAsian };
+
+ScriptBlock script_kind_for_char(
+    const std::string & ch,
+    ScriptBlock current,
+    const std::vector<std::string> & chars,
+    size_t index) {
+    if (internal::is_ascii_letter_char(ch)) return ScriptBlock::Latin;
+    if (internal::is_kana_char(ch) || internal::is_cjk_char(ch)) return ScriptBlock::EastAsian;
+    if (is_digit_char(ch)) {
+        if (current != ScriptBlock::None) return current;
+        for (size_t j = index + 1; j < chars.size() && j < index + 8; ++j) {
+            if (internal::is_kana_char(chars[j]) || internal::is_cjk_char(chars[j])) {
+                return ScriptBlock::EastAsian;
             }
+            if (internal::is_ascii_letter_char(chars[j])) return ScriptBlock::Latin;
         }
-        if (char_lang.empty() && ch.size() >= 3 && c0 >= 0xE4 && c0 <= 0xE9) {
-            // CJK Unified range roughly U+4E00–U+9FFF
-            const uint32_t cp = ((c0 & 0x0F) << 12) | ((static_cast<unsigned char>(ch[1]) & 0x3F) << 6) | (static_cast<unsigned char>(ch[2]) & 0x3F);
-            if (cp >= 0x4E00 && cp <= 0x9FFF)
-                char_lang = (primary_lang == "JP") ? "JP" : "ZH";
-        }
-        if (char_lang.empty() && ch.size() == 1) {
-            const char c = ch[0];
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-                char_lang = "EN";
-            else if (c >= '0' && c <= '9')
-                char_lang = current_lang.empty() ? (primary_lang.empty() ? "EN" : primary_lang) : current_lang;
-        }
-
-        if (char_lang.empty()) {
-            // Punctuation / space — keep with current span
-            char_lang = current_lang.empty() ? "ZH" : current_lang;
-        }
-
-        if (current_lang.empty()) {
-            current_lang = char_lang;
-        }
-
-        if (char_lang != current_lang) {
-            spans.push_back({current_span, current_lang});
-            current_span.clear();
-            current_lang = char_lang;
-        }
-
-        current_span += ch;
+        return ScriptBlock::EastAsian;
     }
+    return current == ScriptBlock::None ? ScriptBlock::EastAsian : current;
+}
 
-    if (!current_span.empty()) {
-        spans.push_back({current_span, current_lang});
+std::vector<std::pair<std::string, std::string>> split_script_blocks(
+    const std::string & text,
+    const std::string & fallback) {
+    std::vector<std::pair<std::string, std::string>> spans;
+    const auto chars = internal::utf8_chars(text);
+    ScriptBlock mode = ScriptBlock::None;
+    size_t block_begin = 0;
+    size_t byte_pos = 0;
+
+    auto push_block = [&](size_t byte_end, ScriptBlock block_mode) {
+        if (byte_end <= block_begin) return;
+        const std::string block = text.substr(block_begin, byte_end - block_begin);
+        if (trim_span_copy(block).empty()) return;
+        std::string lang = fallback;
+        if (block_mode == ScriptBlock::Latin || text_has_latin_letters(block)) {
+            lang = "EN";
+        } else {
+            lang = classify_sentence_language_impl(block, fallback);
+        }
+        if (!spans.empty() && spans.back().second == lang) {
+            spans.back().first += block;
+        } else {
+            spans.push_back({block, lang});
+        }
+    };
+
+    for (size_t i = 0; i < chars.size(); ++i) {
+        const ScriptBlock kind = script_kind_for_char(chars[i], mode, chars, i);
+        if (mode != ScriptBlock::None && kind != ScriptBlock::None && kind != mode) {
+            push_block(byte_pos, mode);
+            block_begin = byte_pos;
+        }
+        if (kind != ScriptBlock::None) mode = kind;
+        byte_pos += chars[i].size();
     }
-
+    if (byte_pos > block_begin) push_block(byte_pos, mode);
+    if (spans.empty() && !trim_span_copy(text).empty()) {
+        spans.push_back({text, classify_sentence_language_impl(text, fallback)});
+    }
     return spans;
 }
 
-TextFeatures text_to_sequence_mixed(const std::string & text) {
-    auto spans = split_text_by_language(text);
+std::vector<std::pair<std::string, std::string>> classify_and_split_sentence(
+    const std::string & sentence,
+    const std::string & fallback) {
+    const std::string trimmed = trim_span_copy(sentence);
+    if (trimmed.empty()) return {};
+
+    if (text_has_kana(trimmed)) return {{sentence, "JP"}};
+    if (text_has_latin_letters(trimmed) && text_has_cjk(trimmed)) {
+        return split_script_blocks(sentence, fallback);
+    }
+    return {{sentence, classify_sentence_language_impl(sentence, fallback)}};
+}
+
+} // namespace
+
+std::string classify_sentence_language(const std::string & sentence, const std::string & fallback) {
+    return classify_sentence_language_impl(sentence, fallback);
+}
+
+std::vector<std::pair<std::string, std::string>> split_text_by_language(
+    const std::string & text, const std::string & primary_lang) {
+    std::vector<std::pair<std::string, std::string>> spans;
+    if (trim_span_copy(text).empty()) return spans;
+
+    const std::string fallback = primary_lang.empty() ? "ZH" : primary_lang;
+    for (const std::string & sentence : split_sentences(text)) {
+        const auto parts = classify_and_split_sentence(sentence, fallback);
+        for (const auto & [segment, lang] : parts) {
+            const std::string trimmed = trim_span_copy(segment);
+            if (trimmed.empty()) continue;
+            if (!spans.empty() && spans.back().second == lang) {
+                spans.back().first += trimmed;
+            } else {
+                spans.push_back({trimmed, lang});
+            }
+        }
+    }
+    if (spans.empty()) spans.push_back({text, fallback});
+    return spans;
+}
+
+namespace {
+
+constexpr int64_t kMixedSpanStartTrim = 3;
+constexpr int64_t kMixedSpanEndTrim = 2;
+
+int64_t mixed_span_phone_begin(size_t index) {
+    return index == 0 ? 0 : kMixedSpanStartTrim;
+}
+
+int64_t mixed_span_phone_end(size_t index, size_t span_count, int64_t full_count) {
+    return (index + 1 == span_count) ? full_count : full_count - kMixedSpanEndTrim;
+}
+
+void append_phone_slice(TextFeatures & merged, const TextFeatures & span, int64_t begin, int64_t end) {
+    if (begin >= end) return;
+    merged.phones.insert(
+        merged.phones.end(),
+        span.phones.begin() + begin,
+        span.phones.begin() + end);
+    merged.tones.insert(
+        merged.tones.end(),
+        span.tones.begin() + begin,
+        span.tones.begin() + end);
+    merged.languages.insert(
+        merged.languages.end(),
+        span.languages.begin() + begin,
+        span.languages.begin() + end);
+}
+
+} // namespace
+
+MixedSequence prepare_mixed_sequence(const std::string & text, const std::string & primary_lang) {
+    MixedSequence out;
+    auto spans = split_text_by_language(text, primary_lang);
     if (spans.empty()) {
-        return text_to_sequence(text, "ZH");
+        out.features = text_to_sequence(text, "ZH");
+        return out;
     }
     if (spans.size() == 1) {
-        return text_to_sequence(text, spans[0].second);
+        out.features = text_to_sequence(text, spans[0].second);
+        return out;
     }
 
-    // Process each span with its language frontend
-    std::vector<TextFeatures> span_features;
-    span_features.reserve(spans.size());
-    for (const auto & [span_text, lang] : spans) {
-        span_features.push_back(text_to_sequence(span_text, lang));
+    int64_t phone_offset = 0;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const auto & [span_text, lang] = spans[i];
+        TextFeatures full = text_to_sequence(span_text, lang);
+        const int64_t begin = mixed_span_phone_begin(i);
+        const int64_t end = mixed_span_phone_end(i, spans.size(), static_cast<int64_t>(full.phones.size()));
+        const int64_t phone_count = end - begin;
+        if (phone_count <= 0) continue;
+
+        MixedSpanInfo info;
+        info.text = span_text;
+        info.lang = lang;
+        info.full_features = std::move(full);
+        info.phone_offset = phone_offset;
+        info.phone_begin_in_full = begin;
+        info.phone_count = phone_count;
+        out.spans.push_back(std::move(info));
+
+        append_phone_slice(out.features, out.spans.back().full_features, begin, end);
+        phone_offset += phone_count;
     }
 
-    // Merge phones, tones, languages (simple concatenation)
-    TextFeatures merged;
-    size_t total_phones = 0;
-    for (const auto & f : span_features) {
-        total_phones += f.phones.size();
-    }
-    merged.phones.reserve(total_phones);
-    merged.tones.reserve(total_phones);
-    merged.languages.reserve(total_phones);
+    return out;
+}
 
-    for (const auto & f : span_features) {
-        merged.phones.insert(merged.phones.end(), f.phones.begin(), f.phones.end());
-        merged.tones.insert(merged.tones.end(), f.tones.begin(), f.tones.end());
-        merged.languages.insert(merged.languages.end(), f.languages.begin(), f.languages.end());
-    }
-
-    // bert_tokens and word2ph are NOT merged — mixed BERT is handled per-span
-    // in synthesize_features, not via the merged TextFeatures.
-
-    return merged;
+TextFeatures text_to_sequence_mixed(const std::string & text) {
+    return prepare_mixed_sequence(text).features;
 }
 
 TextFeatures text_to_sequence(const std::string & text, const std::string & language) {
@@ -1227,6 +1443,30 @@ TextFeatures parse_phone_ids(
     return out;
 }
 
+void copy_bert_slice(
+    Tensor & dst,
+    const Tensor & src,
+    int64_t src_begin,
+    int64_t src_end,
+    int64_t dst_begin) {
+    const int64_t rows = src_end - src_begin;
+    if (rows <= 0) return;
+    if (src.shape.size() != 2 || dst.shape.size() != 2) {
+        throw std::runtime_error("BERT tensors must be rank 2");
+    }
+    if (src_begin < 0 || src_end > src.shape[0] || dst_begin < 0 || dst_begin + rows > dst.shape[0]) {
+        throw std::runtime_error("BERT slice out of range");
+    }
+    for (int64_t i = 0; i < rows; ++i) {
+        const size_t src_offset = static_cast<size_t>((src_begin + i) * kBertDim);
+        const size_t dst_offset = static_cast<size_t>((dst_begin + i) * kBertDim);
+        std::copy(
+            src.data.begin() + src_offset,
+            src.data.begin() + src_offset + static_cast<size_t>(kBertDim),
+            dst.data.begin() + dst_offset);
+    }
+}
+
 Tensor zeros_bert(int64_t phones) {
     return Tensor({phones, kBertDim}, 0.0f);
 }
@@ -1240,6 +1480,12 @@ Tensor random_bert(int64_t phones, uint32_t seed) {
 }
 
 std::map<std::string, int64_t> load_vocab_map(const std::string & vocab_path) {
+    static std::mutex mutex;
+    static std::map<std::string, std::map<std::string, int64_t>> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = cache.find(vocab_path);
+    if (it != cache.end()) return it->second;
+
     std::map<std::string, int64_t> vocab;
     std::ifstream vocab_file(vocab_path);
     if (!vocab_file) {
@@ -1251,7 +1497,8 @@ std::map<std::string, int64_t> load_vocab_map(const std::string & vocab_path) {
         if (!token.empty() && token.back() == '\r') token.pop_back();
         vocab[token] = id++;
     }
-    return vocab;
+    cache.emplace(vocab_path, vocab);
+    return cache.at(vocab_path);
 }
 
 Tensor bert_feature_from_input_ids(
@@ -1346,7 +1593,7 @@ Tensor vocab_bert(
         vocab_parent.c_str(),
         vocab_grandparent.c_str(),
     });
-    const auto vocab = load_vocab_map(resolved_vocab);
+    const auto & vocab = load_vocab_map(resolved_vocab);
     auto token_id = [&](const std::string & value) -> int64_t {
         const auto it = vocab.find(value);
         if (it != vocab.end()) return it->second;
@@ -1414,8 +1661,7 @@ Tensor english_bert(
         spm_grandparent.c_str(),
     });
 
-    SentencePieceTokenizer sp;
-    sp.load(resolved_spm);
+    const SentencePieceTokenizer & sp = cached_sentencepiece(resolved_spm);
     std::vector<int64_t> input_ids = sp.encode(normalize_english_numbers(normalize_english_text(norm_text)));
     input_ids.insert(input_ids.begin(), 1);
     input_ids.push_back(2);
@@ -1464,6 +1710,70 @@ void preload_synthesis_model(
     throw std::runtime_error("this binary was built without ONNX Runtime support");
 #else
     (void)cached_ort_bundle(paths, options);
+#endif
+}
+
+void preload_bert_models(
+    const BertPaths & paths,
+    const SynthesisOptions & options) {
+#ifndef BV2_WITH_ONNXRUNTIME
+    (void)paths; (void)options;
+    throw std::runtime_error("this binary was built without ONNX Runtime support");
+#else
+    if (!paths.zh_model.empty()) {
+        const std::string zh_parent = "../" + paths.zh_model;
+        const std::string zh_grand = "../../" + paths.zh_model;
+        const std::string zh_vocab_parent = "../" + paths.zh_vocab;
+        const std::string zh_vocab_grand = "../../" + paths.zh_vocab;
+        (void)cached_bert_session(
+            first_existing_path({
+                paths.zh_model.c_str(),
+                zh_parent.c_str(),
+                zh_grand.c_str(),
+            }),
+            options);
+        (void)load_vocab_map(first_existing_path({
+            paths.zh_vocab.c_str(),
+            zh_vocab_parent.c_str(),
+            zh_vocab_grand.c_str(),
+        }));
+    }
+    if (!paths.jp_model.empty()) {
+        const std::string jp_parent = "../" + paths.jp_model;
+        const std::string jp_grand = "../../" + paths.jp_model;
+        const std::string jp_vocab_parent = "../" + paths.jp_vocab;
+        const std::string jp_vocab_grand = "../../" + paths.jp_vocab;
+        (void)cached_bert_session(
+            first_existing_path({
+                paths.jp_model.c_str(),
+                jp_parent.c_str(),
+                jp_grand.c_str(),
+            }),
+            options);
+        (void)load_vocab_map(first_existing_path({
+            paths.jp_vocab.c_str(),
+            jp_vocab_parent.c_str(),
+            jp_vocab_grand.c_str(),
+        }));
+    }
+    if (!paths.en_model.empty() && !paths.en_spm.empty()) {
+        const std::string en_parent = "../" + paths.en_model;
+        const std::string en_grand = "../../" + paths.en_model;
+        const std::string spm_parent = "../" + paths.en_spm;
+        const std::string spm_grand = "../../" + paths.en_spm;
+        (void)cached_bert_session(
+            first_existing_path({
+                paths.en_model.c_str(),
+                en_parent.c_str(),
+                en_grand.c_str(),
+            }),
+            options);
+        (void)cached_sentencepiece(first_existing_path({
+            paths.en_spm.c_str(),
+            spm_parent.c_str(),
+            spm_grand.c_str(),
+        }));
+    }
 #endif
 }
 
@@ -1589,16 +1899,19 @@ std::vector<float> synthesize(
     y_len = std::max<int64_t>(1, std::min<int64_t>(y_len, 100000));
 
     Tensor y_mask = sequence_mask({y_len}, y_len);
-    Tensor attn_mask({1, 1, y_len, tx});
-    for (int64_t y = 0; y < y_len; ++y) {
-        for (int64_t xidx = 0; xidx < tx; ++xidx) {
-            attn_mask.data[static_cast<size_t>(y * tx + xidx)] = y_mask(0, 0, y) * x_mask(0, 0, xidx);
+    const int64_t channels = m_p.shape[1];
+    Tensor m_aligned({1, channels, y_len});
+    Tensor logs_aligned({1, channels, y_len});
+    int64_t y = 0;
+    for (int64_t phone = 0; phone < tx; ++phone) {
+        const int64_t dur = static_cast<int64_t>(w_ceil.data[static_cast<size_t>(phone)]);
+        for (int64_t dy = 0; dy < dur && y < y_len; ++dy, ++y) {
+            for (int64_t c = 0; c < channels; ++c) {
+                m_aligned(0, c, y) = m_p(0, c, phone);
+                logs_aligned(0, c, y) = logs_p(0, c, phone);
+            }
         }
     }
-
-    Tensor attn = generate_path(w_ceil, attn_mask);
-    Tensor m_aligned = matmul_attn(attn, m_p);
-    Tensor logs_aligned = matmul_attn(attn, logs_p);
 
     Tensor z_p(m_aligned.shape);
     for (size_t i = 0; i < z_p.data.size(); ++i) {
@@ -1641,10 +1954,25 @@ std::vector<float> synthesize(
 #endif
 }
 
-void write_wav(const std::string & path, const std::vector<float> & audio, int sample_rate) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) throw std::runtime_error("failed to open output wav: " + path);
+template <typename T>
+void append_le(std::vector<char> & out, T value) {
+    const char * bytes = reinterpret_cast<const char *>(&value);
+    out.insert(out.end(), bytes, bytes + sizeof(T));
+}
 
+std::vector<char> encode_pcm16(const std::vector<float> & audio) {
+    std::vector<char> out(audio.size() * sizeof(int16_t));
+    size_t offset = 0;
+    for (float sample : audio) {
+        const float clamped = std::max(-1.0f, std::min(1.0f, sample));
+        const auto s = static_cast<int16_t>(std::lrint(clamped * 32767.0f));
+        out[offset++] = static_cast<char>(s & 0xFF);
+        out[offset++] = static_cast<char>((s >> 8) & 0xFF);
+    }
+    return out;
+}
+
+std::vector<char> encode_wav(const std::vector<float> & audio, int sample_rate) {
     const uint16_t channels = 1;
     const uint16_t bits_per_sample = 16;
     const uint32_t byte_rate = static_cast<uint32_t>(sample_rate * channels * bits_per_sample / 8);
@@ -1652,25 +1980,35 @@ void write_wav(const std::string & path, const std::vector<float> & audio, int s
     const uint32_t data_size = static_cast<uint32_t>(audio.size() * sizeof(int16_t));
     const uint32_t riff_size = 36 + data_size;
 
-    out.write("RIFF", 4);
-    write_le(out, riff_size);
-    out.write("WAVE", 4);
-    out.write("fmt ", 4);
-    write_le<uint32_t>(out, 16);
-    write_le<uint16_t>(out, 1);
-    write_le(out, channels);
-    write_le<uint32_t>(out, static_cast<uint32_t>(sample_rate));
-    write_le(out, byte_rate);
-    write_le(out, block_align);
-    write_le(out, bits_per_sample);
-    out.write("data", 4);
-    write_le(out, data_size);
+    std::vector<char> out;
+    out.reserve(44 + data_size);
+    out.insert(out.end(), {'R', 'I', 'F', 'F'});
+    append_le(out, riff_size);
+    out.insert(out.end(), {'W', 'A', 'V', 'E'});
+    out.insert(out.end(), {'f', 'm', 't', ' '});
+    append_le<uint32_t>(out, 16);
+    append_le<uint16_t>(out, 1);
+    append_le(out, channels);
+    append_le<uint32_t>(out, static_cast<uint32_t>(sample_rate));
+    append_le(out, byte_rate);
+    append_le(out, block_align);
+    append_le(out, bits_per_sample);
+    out.insert(out.end(), {'d', 'a', 't', 'a'});
+    append_le(out, data_size);
 
     for (float sample : audio) {
         const float clamped = std::max(-1.0f, std::min(1.0f, sample));
         const auto s = static_cast<int16_t>(std::lrint(clamped * 32767.0f));
-        write_le(out, s);
+        append_le(out, s);
     }
+    return out;
+}
+
+void write_wav(const std::string & path, const std::vector<float> & audio, int sample_rate) {
+    const std::vector<char> bytes = encode_wav(audio, sample_rate);
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error("failed to open output wav: " + path);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
 } // namespace bv2

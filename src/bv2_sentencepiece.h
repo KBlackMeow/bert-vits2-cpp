@@ -24,4 +24,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+const SentencePieceTokenizer & cached_sentencepiece(const std::string & model_path);
+
 } // namespace bv2

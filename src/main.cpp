@@ -1,12 +1,16 @@
 #include "bv2_tts.h"
+#include "bv2_openjtalk.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <iomanip>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -54,6 +58,7 @@ struct Args {
     size_t max_chunk_chars = 240;
     int chunk_pause_ms = 120;
     bool server = false;
+    bool dump_spans = false;
     std::string host = "127.0.0.1";
     int port = 7860;
     bool device_set = false;
@@ -87,7 +92,7 @@ void usage(const char * exe) {
         << "  --phones IDS           comma separated phone ids, e.g. 0,97,0,8,0\n"
         << "  --tones IDS            comma separated tone ids from the original frontend\n"
         << "  --languages IDS        comma separated language ids from the original frontend\n"
-        << "  --language ZH|JP|EN|AUTO language id for tones/lang embeddings, default AUTO for --text\n"
+        << "  --language ZH|JP|EN|MIX|AUTO language id for tones/lang embeddings, default AUTO for --text\n"
         << "  --speaker N            speaker id\n"
         << "  --speaker-name NAME    speaker name: nahida_ja, illya_ja, sora_ja, tachibana_ja, keqing_zh, keqing_en\n"
         << "  --bert-zh FILE         raw float32 [phones,1024] Chinese BERT features\n"
@@ -101,14 +106,15 @@ void usage(const char * exe) {
         << "  --en-bert-spm FILE     English BERT SentencePiece model path\n"
         << "  --no-bert              disable automatic BERT for --text\n"
         << "  --no-split             disable automatic sentence chunking for --text\n"
+        << "  --dump-spans           print language spans for MIX text and exit\n"
         << "  --max-chunk-chars N    max characters per text chunk, default 240\n"
         << "  --chunk-pause-ms N     silence between chunks, default 120\n"
         << "  --emotion FILE         raw float32 [512,1] emotion feature\n"
         << "  --use-emotion         pass emotion input for V2.2-style ONNX exports; project V2.3 does not use it\n"
         << "  --random-aux           use random BERT/emotion placeholders instead of zeros\n"
-        << "  --noise-scale F        decoder noise scale, default 0.8\n"
-        << "  --noise-scale-w F      duration noise scale, default 0.6\n"
-        << "  --length-scale F       speech length scale, default 1.1\n"
+        << "  --noise-scale F        decoder noise scale, default 0.6\n"
+        << "  --noise-scale-w F      duration noise scale, default 0.9\n"
+        << "  --length-scale F       speech length scale, default 1.0\n"
         << "  --sdp-ratio F          stochastic duration predictor mix, default 0.0\n"
         << "  --sample-rate N        wav sample rate, default 44100\n"
         << "  --seed N               rng seed, default 114514\n"
@@ -133,17 +139,48 @@ bool file_exists(const std::string & path) {
     return f.good();
 }
 
+#ifdef _WIN32
+std::string module_directory() {
+    wchar_t buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    const std::wstring wide(buf, n);
+    const int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string exe(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, exe.data(), size, nullptr, nullptr);
+    const size_t pos = exe.find_last_of("\\/");
+    return pos == std::string::npos ? std::string{} : exe.substr(0, pos);
+}
+#endif
+
 bool cuda_runtime_available() {
 #ifdef _WIN32
+    const std::string exe_dir = module_directory();
+    const std::string bin_cuda = exe_dir + "/onnxruntime_providers_cuda.dll";
+    const std::string bin_shared = exe_dir + "/onnxruntime_providers_shared.dll";
+    const std::string root_cuda = "bin/onnxruntime_providers_cuda.dll";
+    const std::string root_shared = "bin/onnxruntime_providers_shared.dll";
     const bool provider_ok =
-        file_exists("bin/onnxruntime_providers_cuda.dll")
-        && file_exists("bin/onnxruntime_providers_shared.dll");
+        (file_exists(bin_cuda) && file_exists(bin_shared))
+        || (file_exists(root_cuda) && file_exists(root_shared));
     HMODULE driver = LoadLibraryA("nvcuda.dll");
     if (driver) FreeLibrary(driver);
     return provider_ok && driver != nullptr;
 #else
     return false;
 #endif
+}
+
+bv2::BertPaths bert_paths_from(const Args & args) {
+    bv2::BertPaths paths;
+    paths.zh_model = args.zh_bert_model;
+    paths.zh_vocab = args.zh_bert_vocab;
+    paths.jp_model = args.jp_bert_model;
+    paths.jp_vocab = args.jp_bert_vocab;
+    paths.en_model = args.en_bert_model;
+    paths.en_spm = args.en_bert_spm;
+    return paths;
 }
 
 uint32_t utf8_codepoint_at(const std::string & text, size_t pos, size_t & next) {
@@ -197,6 +234,19 @@ bool is_sentence_break_at(const std::string & text, size_t pos, size_t next, uin
     return is_sentence_break(cp);
 }
 
+// First meaningful char language — for primary number reading
+std::string first_char_language(const std::string & text) {
+    for (size_t pos = 0; pos < text.size();) {
+        size_t next = pos + 1;
+        const uint32_t cp = utf8_codepoint_at(text, pos, next);
+        if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x31F0 && cp <= 0x31FF)) return "JP";
+        if (cp >= 0x4E00 && cp <= 0x9FFF) return "ZH";
+        if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return "EN";
+        pos = next;
+    }
+    return "ZH";
+}
+
 std::string detect_language(const std::string & text) {
     bool has_kana = false, has_cjk = false, has_en = false;
     for (size_t pos = 0; pos < text.size();) {
@@ -212,29 +262,15 @@ std::string detect_language(const std::string & text) {
         pos = next;
     }
 
-    // Kana present — Japanese context; if also EN → MIX
-    if (has_kana) {
-        if (has_en) return "MIX";
+    if (has_en && (has_cjk || has_kana)) return "MIX";
+    if (has_cjk && has_kana) {
+        const auto spans = bv2::split_text_by_language(text, first_char_language(text));
+        if (spans.size() > 1) return "MIX";
         return "JP";
     }
-
-    // CJK + EN → MIX
-    if (has_cjk && has_en) return "MIX";
+    if (has_kana) return "JP";
     if (has_cjk) return "ZH";
     if (has_en) return "EN";
-    return "ZH";
-}
-
-// First meaningful char language — for primary number reading
-std::string first_char_language(const std::string & text) {
-    for (size_t pos = 0; pos < text.size();) {
-        size_t next = pos + 1;
-        const uint32_t cp = utf8_codepoint_at(text, pos, next);
-        if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x31F0 && cp <= 0x31FF)) return "JP";
-        if (cp >= 0x4E00 && cp <= 0x9FFF) return "ZH";
-        if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return "EN";
-        pos = next;
-    }
     return "ZH";
 }
 
@@ -393,7 +429,10 @@ std::map<std::string, int64_t> load_speaker_map_from_config(const std::string & 
 int64_t default_speaker_id_for_language(
     const std::string & language,
     const std::map<std::string, int64_t> & speakers) {
-    const char * preferred = language == "EN" ? "keqing_en" : language == "ZH" ? "keqing_zh" : "tachibana_ja";
+    const char * preferred = language == "EN" ? "keqing_en"
+        : language == "ZH" ? "keqing_zh"
+        : language == "MIX" ? "keqing_zh"
+        : "tachibana_ja";
     const auto it = speakers.find(preferred);
     if (it != speakers.end()) return it->second;
     if (language == "JP") {
@@ -401,6 +440,23 @@ int64_t default_speaker_id_for_language(
         if (legacy != speakers.end()) return legacy->second;
     }
     throw std::runtime_error(std::string("default speaker not found in config: ") + preferred);
+}
+
+std::map<std::string, int64_t> speaker_map_for(const Args & args) {
+    static std::mutex mutex;
+    static std::string cached_config_path;
+    static std::map<std::string, int64_t> cached_speakers;
+    const std::string config_path = args.config_path.empty()
+        ? join_path(args.model_dir, "config.json")
+        : args.config_path;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (config_path != cached_config_path) {
+        cached_config_path = config_path;
+        cached_speakers = file_exists(config_path)
+            ? load_speaker_map_from_config(config_path)
+            : default_speaker_map();
+    }
+    return cached_speakers;
 }
 
 Args parse_args(const std::vector<std::string> & argv) {
@@ -441,6 +497,7 @@ Args parse_args(const std::vector<std::string> & argv) {
         else if (key == "--en-bert-model") args.en_bert_model = next(key);
         else if (key == "--en-bert-spm") args.en_bert_spm = next(key);
         else if (key == "--no-bert") args.auto_bert = false;
+        else if (key == "--dump-spans") args.dump_spans = true;
         else if (key == "--no-split") args.split_text = false;
         else if (key == "--max-chunk-chars") args.max_chunk_chars = static_cast<size_t>(std::stoul(next(key)));
         else if (key == "--chunk-pause-ms") args.chunk_pause_ms = std::stoi(next(key));
@@ -478,6 +535,12 @@ Args parse_args(const std::vector<std::string> & argv) {
     if (args.server && !args.device_set) {
         args.options.use_cuda = cuda_runtime_available();
     }
+    if (args.server) {
+        std::cout << "execution device: "
+                  << (args.options.use_cuda ? "cuda" : "cpu");
+        if (!args.device_set) std::cout << " (auto)";
+        std::cout << "\n";
+    }
     if (args.language == "AUTO" && !args.text.empty()) {
         args.language = detect_language(args.text);
     }
@@ -486,8 +549,7 @@ Args parse_args(const std::vector<std::string> & argv) {
         throw std::runtime_error("provide exactly one of --text or --phones");
     }
     if (args.config_path.empty()) args.config_path = join_path(args.model_dir, "config.json");
-    const std::map<std::string, int64_t> speakers =
-        file_exists(args.config_path) ? load_speaker_map_from_config(args.config_path) : default_speaker_map();
+    const std::map<std::string, int64_t> speakers = speaker_map_for(args);
     if (!args.speaker_name.empty()) {
         const auto it = speakers.find(args.speaker_name);
         if (it == speakers.end()) throw std::runtime_error("unknown speaker name: " + args.speaker_name);
@@ -549,114 +611,145 @@ void play_wav_file(const std::string & path) {
 #endif
 }
 
-std::vector<float> synthesize_features(const Args & args, const bv2::TextFeatures & features, const std::string & text_for_bert) {
-    const std::string norm_text = features.norm_text.empty() ? text_for_bert : features.norm_text;
-    const bool is_mixed = (args.auto_bert && args.phones.empty() && args.language == "MIX");
+struct BertBundle {
+    bv2::Tensor zh;
+    bv2::Tensor jp;
+    bv2::Tensor en;
+    bv2::Tensor emo;
+};
 
-    if (is_mixed) {
-        // ── Phone-level mixed: merge all spans, scatter BERT, single synthesis ──
-        std::string primary = first_char_language(text_for_bert);
-        auto spans = bv2::split_text_by_language(text_for_bert, primary);
-        const int64_t n = static_cast<int64_t>(features.phones.size());
-
-        bv2::Tensor zh_bert = bv2::zeros_bert(n);
-        bv2::Tensor jp_bert = bv2::zeros_bert(n);
-        bv2::Tensor en_bert = bv2::zeros_bert(n);
-
-        // Track per-language BERT data and phone positions
-        struct LangSpan { std::vector<std::string> tokens; std::vector<int64_t> word2ph; int64_t phone_start; int64_t phone_count; std::string raw_text; };
-        std::vector<LangSpan> zh_data, jp_data, en_data;
-        int64_t global_phone = 0;
-        for (const auto & [span_text, lang] : spans) {
-            bv2::TextFeatures sf = bv2::text_to_sequence(span_text, lang);
-            LangSpan ls;
-            ls.tokens = sf.bert_tokens;
-            ls.word2ph = sf.word2ph;
-            ls.phone_start = global_phone;
-            ls.phone_count = static_cast<int64_t>(sf.phones.size());
-            ls.raw_text = span_text;
-            if (lang == "ZH") zh_data.push_back(ls);
-            else if (lang == "JP") jp_data.push_back(ls);
-            else if (lang == "EN") en_data.push_back(ls);
-            global_phone += ls.phone_count;
-        }
-
-        // Process each span's BERT individually and scatter to global positions.
-        // This avoids word2ph merging issues and SentencePiece re-tokenization mismatches.
-        for (auto & d : zh_data) {
-            bv2::TextFeatures tf;
-            tf.bert_tokens = d.tokens;
-            tf.word2ph = d.word2ph;
-            tf.phones.resize(static_cast<size_t>(d.phone_count));
-            bv2::Tensor bert = bv2::chinese_bert(args.zh_bert_model, args.zh_bert_vocab, tf, args.options);
-            for (int64_t p = 0; p < d.phone_count; ++p)
-                std::copy_n(bert.data.begin() + p * 1024, 1024, zh_bert.data.begin() + (d.phone_start + p) * 1024);
-        }
-        for (auto & d : jp_data) {
-            bv2::TextFeatures tf;
-            tf.bert_tokens = d.tokens;
-            tf.word2ph = d.word2ph;
-            tf.phones.resize(static_cast<size_t>(d.phone_count));
-            bv2::Tensor bert = bv2::japanese_bert(args.jp_bert_model, args.jp_bert_vocab, tf, args.options);
-            for (int64_t p = 0; p < d.phone_count; ++p)
-                std::copy_n(bert.data.begin() + p * 1024, 1024, jp_bert.data.begin() + (d.phone_start + p) * 1024);
-        }
-        for (auto & d : en_data) {
-            bv2::TextFeatures tf;
-            tf.bert_tokens = d.tokens;
-            tf.word2ph = d.word2ph;
-            tf.phones.resize(static_cast<size_t>(d.phone_count));
-            bv2::Tensor bert = bv2::english_bert(args.en_bert_model, args.en_bert_spm,
-                d.raw_text, tf, args.options);
-            for (int64_t p = 0; p < d.phone_count; ++p)
-                std::copy_n(bert.data.begin() + p * 1024, 1024, en_bert.data.begin() + (d.phone_start + p) * 1024);
-        }
-
-        bv2::Tensor emo = args.options.random_aux ? bv2::random_emotion(args.options.seed + 4) : bv2::zeros_emotion();
-        if (!args.emotion.empty()) emo = bv2::load_float_bin(args.emotion, {512, 1});
-        return bv2::synthesize(args.paths, features, args.options, &zh_bert, &jp_bert, &en_bert, &emo);
-    }
-
-    // ── Single-language path ──
+BertBundle build_single_language_bert(
+    const Args & args,
+    const bv2::TextFeatures & features,
+    const std::string & norm_text,
+    const std::string & language) {
     const int64_t n = static_cast<int64_t>(features.phones.size());
-    bv2::Tensor zh = args.options.random_aux ? bv2::random_bert(n, args.options.seed + 1) : bv2::zeros_bert(n);
-    bv2::Tensor jp = args.options.random_aux ? bv2::random_bert(n, args.options.seed + 2) : bv2::zeros_bert(n);
-    bv2::Tensor en = args.options.random_aux ? bv2::random_bert(n, args.options.seed + 3) : bv2::zeros_bert(n);
-    bv2::Tensor emo = args.options.random_aux ? bv2::random_emotion(args.options.seed + 4) : bv2::zeros_emotion();
+    BertBundle out;
+    out.zh = args.options.random_aux ? bv2::random_bert(n, args.options.seed + 1) : bv2::zeros_bert(n);
+    out.jp = args.options.random_aux ? bv2::random_bert(n, args.options.seed + 2) : bv2::zeros_bert(n);
+    out.en = args.options.random_aux ? bv2::random_bert(n, args.options.seed + 3) : bv2::zeros_bert(n);
+    out.emo = args.options.random_aux ? bv2::random_emotion(args.options.seed + 4) : bv2::zeros_emotion();
 
-    if (!args.bert_zh.empty()) zh = bv2::load_float_bin(args.bert_zh, {n, 1024});
-    else if (args.auto_bert && args.phones.empty() && args.language == "ZH") {
-        zh = bv2::chinese_bert(args.zh_bert_model, args.zh_bert_vocab, features, args.options);
+    if (!args.bert_zh.empty()) out.zh = bv2::load_float_bin(args.bert_zh, {n, 1024});
+    else if (args.auto_bert && args.phones.empty() && language == "ZH") {
+        out.zh = bv2::chinese_bert(args.zh_bert_model, args.zh_bert_vocab, features, args.options);
     }
 
-    if (!args.bert_jp.empty()) jp = bv2::load_float_bin(args.bert_jp, {n, 1024});
-    else if (args.auto_bert && args.phones.empty() && args.language == "JP") {
-        jp = bv2::japanese_bert(args.jp_bert_model, args.jp_bert_vocab, features, args.options);
+    if (!args.bert_jp.empty()) out.jp = bv2::load_float_bin(args.bert_jp, {n, 1024});
+    else if (args.auto_bert && args.phones.empty() && language == "JP") {
+        out.jp = bv2::japanese_bert(args.jp_bert_model, args.jp_bert_vocab, features, args.options);
     }
 
-    if (!args.bert_en.empty()) en = bv2::load_float_bin(args.bert_en, {n, 1024});
-    else if (args.auto_bert && args.phones.empty() && args.language == "EN") {
-        en = bv2::english_bert(args.en_bert_model, args.en_bert_spm, norm_text, features, args.options);
+    if (!args.bert_en.empty()) out.en = bv2::load_float_bin(args.bert_en, {n, 1024});
+    else if (args.auto_bert && args.phones.empty() && language == "EN") {
+        out.en = bv2::english_bert(args.en_bert_model, args.en_bert_spm, norm_text, features, args.options);
     }
 
     if (args.auto_bert && args.phones.empty()) {
-        if (args.language == "ZH") {
-            jp = bv2::random_bert(n, args.options.seed + 2);
-            en = bv2::random_bert(n, args.options.seed + 3);
-        } else if (args.language == "JP") {
-            zh = bv2::random_bert(n, args.options.seed + 1);
-            en = bv2::random_bert(n, args.options.seed + 3);
-        } else if (args.language == "EN") {
-            zh = bv2::random_bert(n, args.options.seed + 1);
-            jp = bv2::random_bert(n, args.options.seed + 2);
+        if (language == "ZH") {
+            out.jp = bv2::random_bert(n, args.options.seed + 2);
+            out.en = bv2::random_bert(n, args.options.seed + 3);
+        } else if (language == "JP") {
+            out.zh = bv2::random_bert(n, args.options.seed + 1);
+            out.en = bv2::random_bert(n, args.options.seed + 3);
+        } else if (language == "EN") {
+            out.zh = bv2::random_bert(n, args.options.seed + 1);
+            out.jp = bv2::random_bert(n, args.options.seed + 2);
         }
     }
-    if (!args.emotion.empty()) emo = bv2::load_float_bin(args.emotion, {512, 1});
+    if (!args.emotion.empty()) out.emo = bv2::load_float_bin(args.emotion, {512, 1});
+    return out;
+}
 
-    return bv2::synthesize(args.paths, features, args.options, &zh, &jp, &en, &emo);
+BertBundle build_mixed_bert(const Args & args, const bv2::MixedSequence & mixed) {
+    const int64_t n = static_cast<int64_t>(mixed.features.phones.size());
+    BertBundle out;
+    out.zh = bv2::random_bert(n, args.options.seed + 1);
+    out.jp = bv2::random_bert(n, args.options.seed + 2);
+    out.en = bv2::random_bert(n, args.options.seed + 3);
+    out.emo = args.options.random_aux ? bv2::random_emotion(args.options.seed + 4) : bv2::zeros_emotion();
+
+    if (!args.bert_zh.empty()) out.zh = bv2::load_float_bin(args.bert_zh, {n, 1024});
+    if (!args.bert_jp.empty()) out.jp = bv2::load_float_bin(args.bert_jp, {n, 1024});
+    if (!args.bert_en.empty()) out.en = bv2::load_float_bin(args.bert_en, {n, 1024});
+    if (!args.emotion.empty()) out.emo = bv2::load_float_bin(args.emotion, {512, 1});
+
+    if (!args.auto_bert || !args.phones.empty()) return out;
+
+    for (const bv2::MixedSpanInfo & span : mixed.spans) {
+        const int64_t src_begin = span.phone_begin_in_full;
+        const int64_t src_end = src_begin + span.phone_count;
+        const std::string & norm_text = span.full_features.norm_text.empty()
+            ? span.text
+            : span.full_features.norm_text;
+
+        if (span.lang == "ZH") {
+            const bv2::Tensor active = bv2::chinese_bert(
+                args.zh_bert_model, args.zh_bert_vocab, span.full_features, args.options);
+            bv2::copy_bert_slice(out.zh, active, src_begin, src_end, span.phone_offset);
+        } else if (span.lang == "JP") {
+            const bv2::Tensor active = bv2::japanese_bert(
+                args.jp_bert_model, args.jp_bert_vocab, span.full_features, args.options);
+            bv2::copy_bert_slice(out.jp, active, src_begin, src_end, span.phone_offset);
+        } else if (span.lang == "EN") {
+            const bv2::Tensor active = bv2::english_bert(
+                args.en_bert_model, args.en_bert_spm, norm_text, span.full_features, args.options);
+            bv2::copy_bert_slice(out.en, active, src_begin, src_end, span.phone_offset);
+        }
+    }
+    return out;
+}
+
+std::vector<float> synthesize_features(
+    const Args & args,
+    const bv2::TextFeatures & features,
+    const std::string & text_for_bert,
+    const std::string & language_override = "") {
+    const std::string language = language_override.empty() ? args.language : language_override;
+    const std::string norm_text = features.norm_text.empty() ? text_for_bert : features.norm_text;
+    const BertBundle bert = build_single_language_bert(args, features, norm_text, language);
+    return bv2::synthesize(
+        args.paths, features, args.options, &bert.zh, &bert.jp, &bert.en, &bert.emo);
+}
+
+std::vector<float> synthesize_single_language_text(const Args & args) {
+    const bv2::TextFeatures features = bv2::text_to_sequence(args.text, args.language);
+    return synthesize_features(args, features, args.text);
+}
+
+std::vector<float> synthesize_mixed_spans(const Args & args) {
+    const std::string primary = first_char_language(args.text);
+    const bv2::MixedSequence mixed = bv2::prepare_mixed_sequence(args.text, primary);
+    if (mixed.spans.empty()) {
+        Args fallback = args;
+        fallback.language = "ZH";
+        return synthesize_single_language_text(fallback);
+    }
+    if (mixed.spans.size() == 1) {
+        Args single = args;
+        single.text = mixed.spans[0].text;
+        single.language = mixed.spans[0].lang;
+        return synthesize_single_language_text(single);
+    }
+
+    std::cout << "mix single-pass spans=" << mixed.spans.size()
+              << " speaker_id=" << args.options.speaker_id << "\n";
+    for (size_t i = 0; i < mixed.spans.size(); ++i) {
+        std::cout << "  span " << mixed.spans[i].lang
+                  << " chars=" << mixed.spans[i].text.size()
+                  << " phones=" << mixed.spans[i].phone_count << "\n";
+    }
+
+    const BertBundle bert = build_mixed_bert(args, mixed);
+    return bv2::synthesize(
+        args.paths, mixed.features, args.options, &bert.zh, &bert.jp, &bert.en, &bert.emo);
 }
 
 std::vector<float> synthesize_text_chunks(const Args & args) {
+    if (args.language == "MIX") {
+        return synthesize_mixed_spans(args);
+    }
+
     const std::vector<std::string> chunks = args.split_text
         ? split_text_chunks(args.text, args.max_chunk_chars)
         : std::vector<std::string>{args.text};
@@ -684,6 +777,58 @@ std::vector<float> synthesize_args(const Args & args) {
     }
     const bv2::TextFeatures features = bv2::parse_phone_ids(args.phones, args.tones, args.languages, args.language);
     return synthesize_features(args, features, args.text);
+}
+
+using AudioChunkCallback = std::function<void(const std::vector<float> &)>;
+
+void synthesize_args_streaming(const Args & args, const AudioChunkCallback & emit_chunk) {
+    if (!args.phones.empty()) {
+        const bv2::TextFeatures features = bv2::parse_phone_ids(args.phones, args.tones, args.languages, args.language);
+        emit_chunk(synthesize_features(args, features, args.text));
+        return;
+    }
+
+    const size_t pause_samples = static_cast<size_t>(
+        static_cast<int64_t>(args.options.sample_rate) * args.chunk_pause_ms / 1000);
+    const auto emit_pause = [&]() {
+        if (pause_samples > 0) {
+            emit_chunk(std::vector<float>(pause_samples, 0.0f));
+        }
+    };
+
+    if (args.language == "MIX") {
+        const std::vector<std::string> chunks = args.split_text
+            ? split_text_chunks(args.text, args.max_chunk_chars)
+            : std::vector<std::string>{args.text};
+        if (chunks.size() > 1) {
+            std::cout << "split text into " << chunks.size() << " chunks (stream)\n";
+        }
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            Args chunk_args = args;
+            chunk_args.text = chunks[i];
+            chunk_args.language = detect_language(chunks[i]);
+            if (chunk_args.language == "MIX") {
+                emit_chunk(synthesize_mixed_spans(chunk_args));
+            } else {
+                const bv2::TextFeatures features = bv2::text_to_sequence(chunks[i], chunk_args.language);
+                emit_chunk(synthesize_features(chunk_args, features, chunks[i]));
+            }
+            if (i + 1 < chunks.size()) emit_pause();
+        }
+        return;
+    }
+
+    const std::vector<std::string> chunks = args.split_text
+        ? split_text_chunks(args.text, args.max_chunk_chars)
+        : std::vector<std::string>{args.text};
+    if (chunks.size() > 1) {
+        std::cout << "split text into " << chunks.size() << " chunks (stream)\n";
+    }
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const bv2::TextFeatures features = bv2::text_to_sequence(chunks[i], args.language);
+        emit_chunk(synthesize_features(args, features, chunks[i]));
+        if (i + 1 < chunks.size()) emit_pause();
+    }
 }
 
 void write_or_play_audio(const Args & args, const std::vector<float> & audio) {
@@ -812,6 +957,115 @@ std::string temp_api_wav_path() {
     return path.string();
 }
 
+class SynthesisGate {
+public:
+    explicit SynthesisGate(int max_concurrent) : max_concurrent_(max_concurrent) {}
+
+    class Guard {
+    public:
+        explicit Guard(SynthesisGate & gate) : gate_(gate) {
+            std::unique_lock<std::mutex> lock(gate_.mutex_);
+            gate_.cv_.wait(lock, [&] { return gate_.active_ < gate_.max_concurrent_; });
+            ++gate_.active_;
+        }
+        ~Guard() {
+            {
+                std::lock_guard<std::mutex> lock(gate_.mutex_);
+                --gate_.active_;
+            }
+            gate_.cv_.notify_one();
+        }
+
+    private:
+        SynthesisGate & gate_;
+    };
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    int active_ = 0;
+    int max_concurrent_;
+};
+
+void apply_optional_float(const std::string & body, const std::string & key, float & value) {
+    std::string raw;
+    if (json_get_raw(body, key, raw)) value = std::stof(raw);
+}
+
+void apply_optional_uint32(const std::string & body, const std::string & key, uint32_t & value) {
+    std::string raw;
+    if (json_get_raw(body, key, raw)) value = static_cast<uint32_t>(std::stoul(raw));
+}
+
+void apply_optional_int64(const std::string & body, const std::string & key, int64_t & value) {
+    std::string raw;
+    if (json_get_raw(body, key, raw)) value = std::stoll(raw);
+}
+
+void apply_optional_size_t(const std::string & body, const std::string & key, size_t & value) {
+    std::string raw;
+    if (json_get_raw(body, key, raw)) value = static_cast<size_t>(std::stoull(raw));
+}
+
+void apply_optional_int(const std::string & body, const std::string & key, int & value) {
+    std::string raw;
+    if (json_get_raw(body, key, raw)) value = std::stoi(raw);
+}
+
+Args args_from_http_tts(const Args & base, const std::string & body, const std::string & out_path) {
+    const std::string normalized_body = unescape_common_json_payload(body);
+    std::string text;
+    if (!json_get_string(normalized_body, "text", text) || text.empty()) {
+        throw std::runtime_error("JSON field text is required; received body: " + normalized_body.substr(0, 200));
+    }
+
+    Args args = base;
+    args.text = text;
+    args.out = out_path;
+    args.phones.clear();
+    args.tones.clear();
+    args.languages.clear();
+    args.speaker_name.clear();
+    args.speaker_set = false;
+
+    std::string language;
+    if (json_get_string(normalized_body, "language", language) && !language.empty()) {
+        args.language = language;
+    }
+    json_get_string(normalized_body, "speaker_name", args.speaker_name);
+    apply_optional_float(normalized_body, "length_scale", args.options.length_scale);
+    apply_optional_float(normalized_body, "noise_scale", args.options.noise_scale);
+    apply_optional_float(normalized_body, "noise_scale_w", args.options.noise_scale_w);
+    apply_optional_float(normalized_body, "sdp_ratio", args.options.sdp_ratio);
+    apply_optional_uint32(normalized_body, "seed", args.options.seed);
+    apply_optional_size_t(normalized_body, "max_chunk_chars", args.max_chunk_chars);
+    apply_optional_int(normalized_body, "chunk_pause_ms", args.chunk_pause_ms);
+    if (json_get_bool(normalized_body, "no_bert")) args.auto_bert = false;
+    if (json_get_bool(normalized_body, "no_split")) args.split_text = false;
+
+    std::string speaker_raw;
+    if (json_get_raw(normalized_body, "speaker", speaker_raw) && !speaker_raw.empty()) {
+        args.options.speaker_id = std::stoll(speaker_raw);
+        args.speaker_set = true;
+    }
+
+    if (args.language == "AUTO") {
+        args.language = detect_language(args.text);
+    }
+
+    const std::map<std::string, int64_t> speakers = speaker_map_for(args);
+    if (!args.speaker_name.empty()) {
+        const auto it = speakers.find(args.speaker_name);
+        if (it == speakers.end()) throw std::runtime_error("unknown speaker name: " + args.speaker_name);
+        args.options.speaker_id = it->second;
+        args.speaker_set = true;
+    }
+    if (!args.speaker_set) {
+        args.options.speaker_id = default_speaker_id_for_language(args.language, speakers);
+    }
+    return args;
+}
+
 std::vector<std::string> build_argv_from_json(const std::string & body, const std::string & out, const Args & base_args) {
     const std::string normalized_body = unescape_common_json_payload(body);
     std::string text;
@@ -877,7 +1131,33 @@ void socket_send_all(SOCKET s, const std::vector<char> & data) {
     }
 }
 
+void socket_send_http_chunk(SOCKET s, const std::vector<char> & data) {
+    if (data.empty()) return;
+    std::ostringstream header;
+    header << std::hex << std::uppercase << data.size() << "\r\n";
+    socket_send_all(s, header.str());
+    socket_send_all(s, data);
+    socket_send_all(s, "\r\n");
+}
+
+void socket_finish_http_chunks(SOCKET s) {
+    socket_send_all(s, "0\r\n\r\n");
+}
+
+std::string http_streaming_pcm_header(int sample_rate) {
+    std::ostringstream ss;
+    ss << "HTTP/1.1 200 OK\r\n"
+       << "Content-Type: audio/L16;rate=" << sample_rate << ";channels=1\r\n"
+       << "X-Sample-Rate: " << sample_rate << "\r\n"
+       << "X-Audio-Format: pcm_s16le\r\n"
+       << "Transfer-Encoding: chunked\r\n"
+       << "Access-Control-Allow-Origin: *\r\n"
+       << "Connection: close\r\n\r\n";
+    return ss.str();
+}
+
 Args g_http_base_args;
+SynthesisGate g_synthesis_gate(4);
 
 std::string http_response_json(int status, const std::string & body) {
     std::ostringstream ss;
@@ -957,7 +1237,7 @@ void handle_http_client(SOCKET client) {
             socket_send_all(client, http_response_json(200, "{\"ok\":true}"));
             return;
         }
-        if (first_line.rfind("POST /tts ", 0) != 0) {
+        if (first_line.rfind("POST /tts ", 0) != 0 && first_line.rfind("POST /tts/stream ", 0) != 0) {
             std::cout << "[" << now_str() << "] " << first_line << " 404" << std::endl;
             socket_send_all(client, http_response_json(404, "{\"error\":\"not found\"}"));
             return;
@@ -968,13 +1248,52 @@ void handle_http_client(SOCKET client) {
         json_get_string(body, "text", text);
         std::string language;
         if (!json_get_string(body, "language", language)) language = "AUTO";
-        std::cout << "[" << now_str() << "] POST /tts  text=\"" << text << "\"  lang=" << language << std::endl;
+        const bool explicit_stream = first_line.rfind("POST /tts/stream ", 0) == 0;
+        const bool stream = explicit_stream || json_get_bool(body, "stream");
+        std::cout << "[" << now_str() << "] POST " << (explicit_stream ? "/tts/stream" : "/tts")
+                  << "  text=\"" << text << "\"  lang=" << language
+                  << (stream ? "  stream=1" : "") << std::endl;
 
         const bool return_json = json_get_bool(body, "return_json");
-        const std::string wav_path = return_json ? output_api_wav_path() : temp_api_wav_path();
-        Args args = parse_args(build_argv_from_json(body, wav_path, g_http_base_args));
-        const std::vector<float> audio = synthesize_args(args);
-        bv2::write_wav(wav_path, audio, args.options.sample_rate);
+        if (stream && return_json) {
+            socket_send_all(client, http_response_json(
+                400, "{\"error\":\"stream cannot be combined with return_json\"}"));
+            return;
+        }
+
+        const std::string wav_path = return_json ? output_api_wav_path() : std::string();
+        Args args = args_from_http_tts(g_http_base_args, body, wav_path);
+
+        if (stream) {
+            size_t total_samples = 0;
+            size_t chunk_count = 0;
+            socket_send_all(client, http_streaming_pcm_header(args.options.sample_rate));
+            {
+                SynthesisGate::Guard gate(g_synthesis_gate);
+                synthesize_args_streaming(args, [&](const std::vector<float> & chunk_audio) {
+                    const std::vector<char> pcm = bv2::encode_pcm16(chunk_audio);
+                    socket_send_http_chunk(client, pcm);
+                    total_samples += chunk_audio.size();
+                    ++chunk_count;
+                });
+            }
+            socket_finish_http_chunks(client);
+
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            const float duration_sec = static_cast<float>(total_samples) / static_cast<float>(args.options.sample_rate);
+            std::cout << "[" << now_str() << "] 200 stream  chunks=" << chunk_count
+                      << "  samples=" << total_samples
+                      << "  dur=" << std::fixed << std::setprecision(1) << duration_sec << "s"
+                      << "  rt=" << elapsed << "ms" << std::endl;
+            return;
+        }
+
+        std::vector<float> audio;
+        {
+            SynthesisGate::Guard gate(g_synthesis_gate);
+            audio = synthesize_args(args);
+        }
 
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
@@ -984,11 +1303,12 @@ void handle_http_client(SOCKET client) {
                   << "  rt=" << elapsed << "ms" << std::endl;
 
         if (return_json) {
+            bv2::write_wav(wav_path, audio, args.options.sample_rate);
             std::ostringstream json;
             json << "{\"ok\":true,\"file\":\"" << json_escape(wav_path) << "\",\"samples\":" << audio.size() << "}";
             socket_send_all(client, http_response_json(200, json.str()));
         } else {
-            const std::vector<char> wav = read_binary_file(wav_path);
+            const std::vector<char> wav = bv2::encode_wav(audio, args.options.sample_rate);
             std::ostringstream header;
             header << "HTTP/1.1 200 OK\r\n"
                    << "Content-Type: audio/wav\r\n"
@@ -997,8 +1317,6 @@ void handle_http_client(SOCKET client) {
                    << "Connection: close\r\n\r\n";
             socket_send_all(client, header.str());
             socket_send_all(client, wav);
-            std::error_code ec;
-            std::filesystem::remove(wav_path, ec);
         }
     } catch (const std::exception & e) {
         std::cerr << "[" << now_str() << "] ERROR 500  " << e.what() << std::endl;
@@ -1012,8 +1330,16 @@ void handle_http_client(SOCKET client) {
 
 int run_http_server(const Args & args) {
     g_http_base_args = args;
-    std::cout << "preloading VITS ONNX sessions...\n";
+    std::cout << "preloading VITS ONNX sessions";
+    if (args.options.use_cuda) std::cout << " (cuda:" << args.options.cuda_device_id << ")";
+    else std::cout << " (cpu)";
+    std::cout << "...\n";
     bv2::preload_synthesis_model(args.paths, args.options);
+    std::cout << "preloading BERT ONNX sessions...\n";
+    bv2::preload_bert_models(bert_paths_from(args), args.options);
+    if (bv2::openjtalk_available()) {
+        std::cout << "openjtalk dictionary ready\n";
+    }
     std::cout << "preload complete\n";
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup failed");
@@ -1042,8 +1368,11 @@ int run_http_server(const Args & args) {
     if (!args.device_set) std::cout << " (auto)";
     std::cout << "\n";
     std::cout << "example request: POST /tts with JSON {\"text\":\"hello\",\"language\":\"EN\"}\n";
+    std::cout << "stream request: POST /tts/stream or POST /tts with {\"stream\":true}\n";
     std::cout << "curl example: curl -X POST http://" << args.host << ":" << args.port
               << "/tts -H \"Content-Type: application/json\" --data-raw \"{\\\"text\\\":\\\"hello\\\",\\\"language\\\":\\\"EN\\\"}\"\n";
+    std::cout << "curl stream: curl -N -X POST http://" << args.host << ":" << args.port
+              << "/tts/stream -H \"Content-Type: application/json\" --data-raw \"{\\\"text\\\":\\\"你好，这是流式测试。\\\",\\\"language\\\":\\\"ZH\\\"}\" --output output\\stream.pcm\n";
     while (true) {
         SOCKET client = accept(server, nullptr, nullptr);
         if (client == INVALID_SOCKET) continue;
@@ -1066,6 +1395,20 @@ int app_main(const std::vector<std::string> & argv) {
     try {
         Args args = parse_args(argv);
         if (args.server) return run_http_server(args);
+        if (args.dump_spans) {
+            const std::string primary = first_char_language(args.text);
+            const auto spans = bv2::split_text_by_language(args.text, primary);
+            std::cout << "primary=" << primary << " spans=" << spans.size() << "\n";
+            for (size_t i = 0; i < spans.size(); ++i) {
+                const auto & [seg, lang] = spans[i];
+                std::string preview = seg.substr(0, std::min(seg.size(), size_t{48}));
+                for (char & c : preview) {
+                    if (c == '\n' || c == '\r') c = ' ';
+                }
+                std::cout << i << " " << lang << " len=" << seg.size() << " \"" << preview << "\"\n";
+            }
+            return 0;
+        }
         write_or_play_audio(args, synthesize_args(args));
         return 0;
     } catch (const std::exception & e) {

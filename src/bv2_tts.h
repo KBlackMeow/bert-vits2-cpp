@@ -36,12 +36,21 @@ struct ModelPaths {
     std::string dec;
 };
 
+struct BertPaths {
+    std::string zh_model;
+    std::string zh_vocab;
+    std::string jp_model;
+    std::string jp_vocab;
+    std::string en_model;
+    std::string en_spm;
+};
+
 struct SynthesisOptions {
     int64_t speaker_id = 0;
     uint32_t seed = 114514;
-    float noise_scale = 0.8f;
-    float noise_scale_w = 0.6f;
-    float length_scale = 1.1f;
+    float noise_scale = 0.6f;
+    float noise_scale_w = 0.9f;
+    float length_scale = 1.0f;
     float sdp_ratio = 0.0f;
     int sample_rate = 44100;
     bool random_aux = false;
@@ -55,6 +64,24 @@ TextFeatures text_to_sequence(const std::string & text, const std::string & lang
 std::vector<std::pair<std::string, std::string>> split_text_by_language(
     const std::string & text, const std::string & primary_lang = "ZH");
 
+// Sentence-level ZH/JP disambiguation for kanji-heavy text (returns ZH or JP).
+std::string classify_sentence_language(const std::string & sentence, const std::string & fallback = "ZH");
+
+struct MixedSpanInfo {
+    std::string text;
+    std::string lang;
+    TextFeatures full_features;
+    int64_t phone_offset = 0;
+    int64_t phone_begin_in_full = 0;
+    int64_t phone_count = 0;
+};
+
+struct MixedSequence {
+    TextFeatures features;
+    std::vector<MixedSpanInfo> spans;
+};
+
+MixedSequence prepare_mixed_sequence(const std::string & text, const std::string & primary_lang = "ZH");
 TextFeatures text_to_sequence_mixed(const std::string & text);
 
 TextFeatures parse_phone_ids(const std::string & csv, const std::string & language);
@@ -65,6 +92,12 @@ TextFeatures parse_phone_ids(
     const std::string & default_language);
 
 Tensor zeros_bert(int64_t phones);
+void copy_bert_slice(
+    Tensor & dst,
+    const Tensor & src,
+    int64_t src_begin,
+    int64_t src_end,
+    int64_t dst_begin);
 Tensor random_bert(int64_t phones, uint32_t seed);
 Tensor chinese_bert(
     const std::string & bert_onnx_path,
@@ -90,6 +123,10 @@ void preload_synthesis_model(
     const ModelPaths & paths,
     const SynthesisOptions & options);
 
+void preload_bert_models(
+    const BertPaths & paths,
+    const SynthesisOptions & options);
+
 std::vector<float> synthesize(
     const ModelPaths & paths,
     const TextFeatures & text,
@@ -100,5 +137,10 @@ std::vector<float> synthesize(
     const Tensor * emotion);
 
 void write_wav(const std::string & path, const std::vector<float> & audio, int sample_rate);
+
+std::vector<char> encode_wav(const std::vector<float> & audio, int sample_rate);
+
+// Little-endian signed 16-bit PCM samples in [-1, 1].
+std::vector<char> encode_pcm16(const std::vector<float> & audio);
 
 } // namespace bv2
