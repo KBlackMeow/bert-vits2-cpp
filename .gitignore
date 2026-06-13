@@ -1,0 +1,13 @@
+# Model assets (download or export separately)
+bert/
+onnx/
+
+# Build outputs
+build/
+build-cl/
+bin/
+output/
+
+# ONNX Runtime NuGet packages (place under third_party/ before building)
+third_party/onnxruntime-gpu-windows-nuget/
+third_party/onnxruntime-nuget/
