@@ -6,14 +6,14 @@ multilingual BERT models, tokenizer assets, and ONNX Runtime DLLs.
 Run and play audio directly:
 
 ```powershell
-.\bin\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh
+.\bin\windows\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh
 ```
 
 Mixed Chinese + Japanese + English in one sentence (`--language AUTO` detects `MIX`).
 Each MIX span keeps its own language frontend (`ZH` / `EN` / `JP` phones, tones, BERT). `--speaker-name` applies to the whole utterance and only changes voice style:
 
 ```powershell
-.\bin\bert-vits2-project.exe --text "你好，Hello，こんにちは。" --language AUTO --speaker-name keqing_zh -o output\mix.wav
+.\bin\windows\bert-vits2-project.exe --text "你好，Hello，こんにちは。" --language AUTO --speaker-name keqing_zh -o output\mix.wav
 ```
 
 Use `--dump-spans` to inspect how the text is split before synthesis.
@@ -21,8 +21,8 @@ Use `--dump-spans` to inspect how the text is split before synthesis.
 Write a wav file instead:
 
 ```powershell
-.\bin\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh -o output\out.wav
-.\bin\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh --device cuda -o output\out_cuda.wav
+.\bin\windows\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh -o output\out.wav
+.\bin\windows\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh --device cuda -o output\out_cuda.wav
 ```
 
 When `-o` or `--output` is omitted, the program writes a temporary wav, plays it
@@ -75,23 +75,23 @@ Invoke-WebRequest -Uri "https://huggingface.co/microsoft/deberta-v3-large/resolv
 Examples:
 
 ```powershell
-.\bin\bert-vits2-project.exe --text "Hello, world." --language EN --speaker-name keqing_en
-.\bin\bert-vits2-project.exe --text "こんにちは、世界。" --language JP --speaker-name tachibana_ja
-.\bin\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh
+.\bin\windows\bert-vits2-project.exe --text "Hello, world." --language EN --speaker-name keqing_en
+.\bin\windows\bert-vits2-project.exe --text "こんにちは、世界。" --language JP --speaker-name tachibana_ja
+.\bin\windows\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh
 ```
 
 Built-in C++ HTTP API:
 
 ```powershell
-.\bin\bert-vits2-project.exe --server --host 127.0.0.1 --port 7860
+.\bin\windows\bert-vits2-project.exe --server --host 127.0.0.1 --port 7860
 ```
 
 The server auto-selects CUDA when CUDA Runtime and ONNX Runtime CUDA provider
 are available. Override the server-wide device at startup:
 
 ```powershell
-.\bin\bert-vits2-project.exe --server --device cuda --cuda-device 0
-.\bin\bert-vits2-project.exe --server --device cpu
+.\bin\windows\bert-vits2-project.exe --server --device cuda --cuda-device 0
+.\bin\windows\bert-vits2-project.exe --server --device cpu
 ```
 
 In server mode, the VITS and language BERT ONNX sessions are preloaded at startup
@@ -266,4 +266,114 @@ cmake --build build --config Release
 
 The build auto-detects `third_party/onnxruntime-gpu-windows-nuget` or
 `third_party/onnxruntime-nuget`, copies ONNX Runtime DLLs, and writes
-`bin\bert-vits2-project.exe`.
+`bin\windows\bert-vits2-project.exe`.
+
+## Linux
+
+Install build tools (Debian/Ubuntu):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y cmake build-essential curl
+```
+
+Fetch ONNX Runtime (CPU by default; set `ONNXRUNTIME_GPU=1` for CUDA build):
+
+```bash
+bash scripts/fetch_onnxruntime_linux.sh
+cmake -B build-linux -S . -DCMAKE_BUILD_TYPE=Release \
+  -DONNXRUNTIME_ROOT=$PWD/third_party/onnxruntime-linux
+cmake --build build-linux -j$(nproc)
+```
+
+The build writes `bin/linux/bert-vits2-project` (or `build-cl/linux/bert-vits2-project`
+if `bin/` does not exist) and copies ONNX Runtime `.so` files next to the executable.
+Output directories are platform-segregated: Windows lands in `bin/windows/`, Linux in
+`bin/linux/`, macOS in `bin/macos/`.
+
+Run from the project root so relative model and frontend paths resolve:
+
+```bash
+./bin/linux/bert-vits2-project --text "你好，这是测试。" --language ZH --speaker-name keqing_zh
+./bin/linux/bert-vits2-project --text "你好，Hello，こんにちは。" --language AUTO --speaker-name keqing_zh -o output/mix.wav
+./bin/linux/bert-vits2-project --text "Hello, world." --language EN --speaker-name keqing_en -o output/out.wav
+./bin/linux/bert-vits2-project --text "こんにちは、世界。" --language JP --speaker-name tachibana_ja
+./bin/linux/bert-vits2-project --text "你好，这是测试。" --language ZH --speaker-name keqing_zh --device cuda -o output/out_cuda.wav
+```
+
+When `-o` is omitted, audio is played with `paplay`, `aplay`, or `ffplay`
+(whichever is available). Use `-o` to write a wav file instead.
+
+HTTP server:
+
+```bash
+./bin/linux/bert-vits2-project --server --host 127.0.0.1 --port 7860
+./bin/linux/bert-vits2-project --server --device cuda --cuda-device 0
+```
+
+API examples:
+
+```bash
+curl -X POST http://127.0.0.1:7860/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"你好，这是接口测试。","language":"ZH","speaker_name":"keqing_zh"}' \
+  --output output/api_test.wav
+
+curl -N -X POST http://127.0.0.1:7860/tts/stream \
+  -H "Content-Type: application/json" \
+  -d '{"text":"你好，这是流式测试。","language":"ZH","speaker_name":"keqing_zh"}' \
+  --output output/stream.pcm
+```
+
+For CUDA, use the GPU ONNX Runtime package:
+
+```bash
+ONNXRUNTIME_GPU=1 bash scripts/build_linux.sh
+```
+
+`libonnxruntime_providers_cuda.so` and `libonnxruntime_providers_shared.so` are
+copied next to the executable automatically, same as on Windows.
+
+Two options for CUDA Toolkit + cuDNN runtime libraries:
+
+1. **System install (lean `bin/linux/`, ~700 MB):**
+   ```bash
+   sudo apt-get install -y libcudnn9-cuda-12 cuda-cudart-12-x cuda-libraries-12-x
+   sudo ldconfig
+   ```
+
+2. **Bundle next to the binary (self-contained `bin/linux/`):**
+   ```bash
+   sudo apt-get install -y libcudnn9-cuda-12   # installs cuDNN into /usr/lib/x86_64-linux-gnu
+
+   # full bundle (~3 GB, mirrors Windows' DLL set)
+   bash scripts/bundle_cuda_linux.sh
+
+   # minimal bundle (~1.9 GB, drops libs VITS/BERT don't use:
+   # cuFFT, cuRAND, cudnn_adv, cudnn_engines_precompiled, cudnn_heuristic, cudnn_ext)
+   bash scripts/bundle_cuda_linux.sh --minimal
+   ```
+   `libcuda.so.1` is intentionally **not** bundled — it must come from the
+   NVIDIA driver on the host. Test the self-contained build with an empty
+   `LD_LIBRARY_PATH`:
+   ```bash
+   LD_LIBRARY_PATH= ./bin/linux/bert-vits2-project --server --device cuda
+   ```
+
+Either way `RPATH=$ORIGIN` lets `bert-vits2-project` find the libraries that
+sit next to it. Verify CUDA is actually engaged by checking the startup log:
+
+```text
+preloading VITS ONNX sessions (cuda:0)...
+device: cuda
+```
+
+Manual ONNX Runtime setup (instead of the fetch script):
+
+```bash
+curl -L -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz
+mkdir -p third_party/onnxruntime-linux
+tar -xzf ort.tgz -C third_party/onnxruntime-linux --strip-components=1
+cmake -B build-linux -S . -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT=$PWD/third_party/onnxruntime-linux
+cmake --build build-linux -j$(nproc)
+```

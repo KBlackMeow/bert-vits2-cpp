@@ -4,6 +4,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <filesystem>
 #include <fstream>
@@ -25,9 +29,28 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <mmsystem.h>
+#else
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace {
+
+#ifdef _WIN32
+using SocketHandle = SOCKET;
+constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
+#else
+using SocketHandle = int;
+constexpr SocketHandle kInvalidSocket = -1;
+#ifndef SOMAXCONN
+constexpr int SOMAXCONN = 128;
+#endif
+#endif
 
 struct Args {
     bv2::ModelPaths paths;
@@ -152,6 +175,16 @@ std::string module_directory() {
     const size_t pos = exe.find_last_of("\\/");
     return pos == std::string::npos ? std::string{} : exe.substr(0, pos);
 }
+#else
+std::string module_directory() {
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return {};
+    buf[n] = '\0';
+    std::string exe(buf);
+    const size_t pos = exe.find_last_of('/');
+    return pos == std::string::npos ? std::string{} : exe.substr(0, pos);
+}
 #endif
 
 bool cuda_runtime_available() {
@@ -159,16 +192,45 @@ bool cuda_runtime_available() {
     const std::string exe_dir = module_directory();
     const std::string bin_cuda = exe_dir + "/onnxruntime_providers_cuda.dll";
     const std::string bin_shared = exe_dir + "/onnxruntime_providers_shared.dll";
-    const std::string root_cuda = "bin/onnxruntime_providers_cuda.dll";
-    const std::string root_shared = "bin/onnxruntime_providers_shared.dll";
+    const std::string root_cuda = "bin/windows/onnxruntime_providers_cuda.dll";
+    const std::string root_shared = "bin/windows/onnxruntime_providers_shared.dll";
+    const std::string legacy_root_cuda = "bin/onnxruntime_providers_cuda.dll";
+    const std::string legacy_root_shared = "bin/onnxruntime_providers_shared.dll";
     const bool provider_ok =
         (file_exists(bin_cuda) && file_exists(bin_shared))
-        || (file_exists(root_cuda) && file_exists(root_shared));
+        || (file_exists(root_cuda) && file_exists(root_shared))
+        || (file_exists(legacy_root_cuda) && file_exists(legacy_root_shared));
     HMODULE driver = LoadLibraryA("nvcuda.dll");
     if (driver) FreeLibrary(driver);
     return provider_ok && driver != nullptr;
 #else
-    return false;
+    void * driver = dlopen("libcuda.so.1", RTLD_LAZY);
+    if (!driver) driver = dlopen("libcuda.so", RTLD_LAZY);
+    if (!driver) return false;
+    dlclose(driver);
+
+    const std::string exe_dir = module_directory();
+    const std::vector<std::string> candidates = {
+        exe_dir + "/libonnxruntime_providers_cuda.so",
+        exe_dir + "/libonnxruntime_providers_shared.so",
+        "bin/linux/libonnxruntime_providers_cuda.so",
+        "bin/linux/libonnxruntime_providers_shared.so",
+        "bin/libonnxruntime_providers_cuda.so",
+        "bin/libonnxruntime_providers_shared.so",
+    };
+    const bool provider_files =
+        (file_exists(candidates[0]) && file_exists(candidates[1]))
+        || (file_exists(candidates[2]) && file_exists(candidates[3]))
+        || (file_exists(candidates[4]) && file_exists(candidates[5]));
+    if (provider_files) return true;
+
+    void * cuda_provider = dlopen("libonnxruntime_providers_cuda.so", RTLD_LAZY);
+    if (!cuda_provider && !exe_dir.empty()) {
+        cuda_provider = dlopen((exe_dir + "/libonnxruntime_providers_cuda.so").c_str(), RTLD_LAZY);
+    }
+    if (!cuda_provider) return false;
+    dlclose(cuda_provider);
+    return true;
 #endif
 }
 
@@ -588,13 +650,46 @@ std::string wide_to_utf8(const wchar_t * value) {
 }
 #endif
 
+#ifndef _WIN32
+std::string shell_quote(const std::string & value) {
+    std::string out = "'";
+    for (char c : value) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out += "'";
+    return out;
+}
+
+bool command_succeeds(const std::string & command) {
+    const int rc = std::system(command.c_str());
+    return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+}
+
+bool command_exists(const std::string & name) {
+    return command_succeeds("command -v " + shell_quote(name) + " >/dev/null 2>&1");
+}
+
+std::string read_command_output(const std::string & command) {
+    std::string out;
+    FILE * pipe = popen(command.c_str(), "r");
+    if (!pipe) return out;
+    char buffer[512];
+    while (fgets(buffer, sizeof(buffer), pipe)) out += buffer;
+    const int rc = pclose(pipe);
+    if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) return {};
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
+}
+#endif
+
 std::string playback_temp_wav_path() {
     const auto path = std::filesystem::temp_directory_path()
         / ("bert-vits2-cpp-play-" + std::to_string(
 #ifdef _WIN32
             GetCurrentProcessId()
 #else
-            0
+            getpid()
 #endif
         ) + ".wav");
     return path.string();
@@ -607,7 +702,29 @@ void play_wav_file(const std::string & path) {
         throw std::runtime_error("failed to play wav: " + path);
     }
 #else
-    throw std::runtime_error("direct playback is only implemented on Windows; pass -o to write a wav file");
+    const std::string quoted = shell_quote(path);
+    if (command_exists("paplay") && command_succeeds("paplay " + quoted)) return;
+    if (command_exists("aplay") && command_succeeds("aplay -q " + quoted)) return;
+    if (command_exists("ffplay") && command_succeeds("ffplay -nodisp -autoexit -loglevel quiet " + quoted)) return;
+    if (command_exists("powershell.exe")) {
+        const std::string win_path = read_command_output("wslpath -w " + quoted + " 2>/dev/null");
+        if (!win_path.empty()) {
+            std::string escaped = win_path;
+            size_t pos = 0;
+            while ((pos = escaped.find('\'', pos)) != std::string::npos) {
+                escaped.insert(pos, "'");
+                pos += 2;
+            }
+            const std::string ps =
+                "powershell.exe -NoProfile -Command "
+                + shell_quote(std::string("$p='") + escaped
+                    + "'; $player=New-Object System.Media.SoundPlayer $p; $player.PlaySync()");
+            if (command_succeeds(ps)) return;
+        }
+    }
+    throw std::runtime_error(
+        "failed to play wav; install paplay/aplay/ffplay, use WSL powershell.exe audio, or pass -o to write a wav file: "
+        + path);
 #endif
 }
 
@@ -1112,26 +1229,41 @@ std::vector<char> read_binary_file(const std::string & path) {
     return std::vector<char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
+void socket_close(SocketHandle s) {
 #ifdef _WIN32
-void socket_send_all(SOCKET s, const std::string & data) {
+    closesocket(s);
+#else
+    close(s);
+#endif
+}
+
+void socket_send_all(SocketHandle s, const std::string & data) {
     size_t sent = 0;
     while (sent < data.size()) {
+#ifdef _WIN32
         const int n = send(s, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+#else
+        const ssize_t n = send(s, data.data() + sent, data.size() - sent, 0);
+#endif
         if (n <= 0) throw std::runtime_error("socket send failed");
         sent += static_cast<size_t>(n);
     }
 }
 
-void socket_send_all(SOCKET s, const std::vector<char> & data) {
+void socket_send_all(SocketHandle s, const std::vector<char> & data) {
     size_t sent = 0;
     while (sent < data.size()) {
+#ifdef _WIN32
         const int n = send(s, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+#else
+        const ssize_t n = send(s, data.data() + sent, data.size() - sent, 0);
+#endif
         if (n <= 0) throw std::runtime_error("socket send failed");
         sent += static_cast<size_t>(n);
     }
 }
 
-void socket_send_http_chunk(SOCKET s, const std::vector<char> & data) {
+void socket_send_http_chunk(SocketHandle s, const std::vector<char> & data) {
     if (data.empty()) return;
     std::ostringstream header;
     header << std::hex << std::uppercase << data.size() << "\r\n";
@@ -1140,7 +1272,7 @@ void socket_send_http_chunk(SOCKET s, const std::vector<char> & data) {
     socket_send_all(s, "\r\n");
 }
 
-void socket_finish_http_chunks(SOCKET s) {
+void socket_finish_http_chunks(SocketHandle s) {
     socket_send_all(s, "0\r\n\r\n");
 }
 
@@ -1201,14 +1333,18 @@ size_t content_length_from_headers(const std::string & request) {
     return static_cast<size_t>(std::stoul(request.substr(begin, end - begin)));
 }
 
-void handle_http_client(SOCKET client) {
+void handle_http_client(SocketHandle client) {
     try {
         const auto t0 = std::chrono::steady_clock::now();
         std::string request;
         char buffer[8192];
         size_t header_end = std::string::npos;
         while ((header_end = request.find("\r\n\r\n")) == std::string::npos) {
-            const int n = recv(client, buffer, sizeof(buffer), 0);
+#ifdef _WIN32
+            const int n = recv(client, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
+            const ssize_t n = recv(client, buffer, sizeof(buffer), 0);
+#endif
             if (n <= 0) return;
             request.append(buffer, buffer + n);
         }
@@ -1216,7 +1352,11 @@ void handle_http_client(SOCKET client) {
         const size_t content_length = content_length_from_headers(request);
         const size_t body_start = header_end + 4;
         while (request.size() < body_start + content_length) {
-            const int n = recv(client, buffer, sizeof(buffer), 0);
+#ifdef _WIN32
+            const int n = recv(client, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
+            const ssize_t n = recv(client, buffer, sizeof(buffer), 0);
+#endif
             if (n <= 0) break;
             request.append(buffer, buffer + n);
         }
@@ -1341,25 +1481,34 @@ int run_http_server(const Args & args) {
         std::cout << "openjtalk dictionary ready\n";
     }
     std::cout << "preload complete\n";
+#ifdef _WIN32
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup failed");
+#endif
 
-    SOCKET server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (server == INVALID_SOCKET) throw std::runtime_error("socket creation failed");
+    SocketHandle server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server == kInvalidSocket) throw std::runtime_error("socket creation failed");
+
+    int reuse = 1;
+#ifdef _WIN32
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse), sizeof(reuse));
+#else
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<u_short>(args.port));
+    addr.sin_port = htons(static_cast<uint16_t>(args.port));
     if (inet_pton(AF_INET, args.host.c_str(), &addr.sin_addr) != 1) {
-        closesocket(server);
+        socket_close(server);
         throw std::runtime_error("invalid --host: " + args.host);
     }
-    if (bind(server, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(server);
+    if (bind(server, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        socket_close(server);
         throw std::runtime_error("bind failed");
     }
-    if (listen(server, SOMAXCONN) == SOCKET_ERROR) {
-        closesocket(server);
+    if (listen(server, SOMAXCONN) < 0) {
+        socket_close(server);
         throw std::runtime_error("listen failed");
     }
 
@@ -1372,21 +1521,16 @@ int run_http_server(const Args & args) {
     std::cout << "curl example: curl -X POST http://" << args.host << ":" << args.port
               << "/tts -H \"Content-Type: application/json\" --data-raw \"{\\\"text\\\":\\\"hello\\\",\\\"language\\\":\\\"EN\\\"}\"\n";
     std::cout << "curl stream: curl -N -X POST http://" << args.host << ":" << args.port
-              << "/tts/stream -H \"Content-Type: application/json\" --data-raw \"{\\\"text\\\":\\\"你好，这是流式测试。\\\",\\\"language\\\":\\\"ZH\\\"}\" --output output\\stream.pcm\n";
+              << "/tts/stream -H \"Content-Type: application/json\" --data-raw \"{\\\"text\\\":\\\"你好，这是流式测试。\\\",\\\"language\\\":\\\"ZH\\\"}\" --output output/stream.pcm\n";
     while (true) {
-        SOCKET client = accept(server, nullptr, nullptr);
-        if (client == INVALID_SOCKET) continue;
+        SocketHandle client = accept(server, nullptr, nullptr);
+        if (client == kInvalidSocket) continue;
         std::thread([client]() {
             handle_http_client(client);
-            closesocket(client);
+            socket_close(client);
         }).detach();
     }
 }
-#else
-int run_http_server(const Args &) {
-    throw std::runtime_error("HTTP server is only implemented on Windows");
-}
-#endif
 
 int app_main(const std::vector<std::string> & argv) {
 #ifdef _WIN32

@@ -26,7 +26,14 @@ JP_STREAM_REQUEST = {
 }
 
 
-def post_json(path: str, payload: dict) -> tuple[int, bytes, dict]:
+def default_server_cmd() -> str:
+    if sys.platform == "win32":
+        return ".\\bin\\windows\\bert-vits2-project.exe --server --host 127.0.0.1 --port 7860"
+    if sys.platform == "darwin":
+        return "./bin/macos/bert-vits2-project --server --host 127.0.0.1 --port 7860"
+    return "./bin/linux/bert-vits2-project --server --host 127.0.0.1 --port 7860"
+
+
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         f"{BASE_URL}{path}",
@@ -97,7 +104,7 @@ def main() -> int:
             return 1
     except urllib.error.URLError as exc:
         print(f"server not reachable at {BASE_URL}: {exc}")
-        print("start server: .\\bin\\bert-vits2-project.exe --server --host 127.0.0.1 --port 7860")
+        print(f"start server: {default_server_cmd()}")
         return 1
 
     test_jp_tts_wav()

@@ -5,9 +5,15 @@ onnx/
 # Build outputs
 build/
 build-cl/
-bin/
+build-linux/
+build-linux-test/
+bin/                 # platform-segregated: bin/windows/, bin/linux/, bin/macos/
 output/
 
-# ONNX Runtime NuGet packages (place under third_party/ before building)
+# ONNX Runtime packages (place under third_party/ before building)
 third_party/onnxruntime-gpu-windows-nuget/
 third_party/onnxruntime-nuget/
+third_party/onnxruntime-linux/
+third_party/onnxruntime-gpu-linux/
+third_party/onnxruntime-linux-nuget/
+third_party/onnxruntime-gpu-linux-nuget/

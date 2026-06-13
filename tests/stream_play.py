@@ -84,6 +84,14 @@ def build_payload(args: argparse.Namespace) -> dict:
     return payload
 
 
+def default_server_cmd() -> str:
+    if sys.platform == "win32":
+        return ".\\bin\\windows\\bert-vits2-project.exe --server --host 127.0.0.1 --port 7860"
+    if sys.platform == "darwin":
+        return "./bin/macos/bert-vits2-project --server --host 127.0.0.1 --port 7860"
+    return "./bin/linux/bert-vits2-project --server --host 127.0.0.1 --port 7860"
+
+
 def check_health(host: str, port: int) -> None:
     url = f"http://{host}:{port}/health"
     with urllib.request.urlopen(url, timeout=5) as resp:
@@ -185,10 +193,7 @@ def main() -> int:
         check_health(args.host, args.port)
     except urllib.error.URLError as exc:
         print(f"server not reachable: http://{args.host}:{args.port} ({exc})")
-        print(
-            "start server: .\\bin\\bert-vits2-project.exe --server "
-            "--host 127.0.0.1 --port 7860"
-        )
+        print(f"start server: {default_server_cmd()}")
         return 1
 
     try:

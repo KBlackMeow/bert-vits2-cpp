@@ -1,0 +1,37 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Fetch ONNX Runtime
+        env:
+          ONNXRUNTIME_VERSION: "1.20.1"
+        run: bash scripts/fetch_onnxruntime_linux.sh
+
+      - name: Configure
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=Release
+          -DONNXRUNTIME_ROOT=${{ github.workspace }}/third_party/onnxruntime-linux
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Verify ONNX Runtime libraries were copied
+        run: |
+          if [[ -d bin ]]; then OUTPUT_DIR=bin/linux; else OUTPUT_DIR=build-cl/linux; fi
+          test -f "${OUTPUT_DIR}/libonnxruntime.so"
+          test -f "${OUTPUT_DIR}/bert-vits2-project"
+
+      - name: Run frontend regression test
+        run: ctest --test-dir build -R jp_frontend --output-on-failure

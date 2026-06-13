@@ -8,16 +8,27 @@ project(bert_vits2_cpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+find_package(Threads REQUIRED)
 
 option(BERT_VITS2_WITH_ONNXRUNTIME "Build ONNX Runtime based Bert-VITS2 inference" ON)
 
 set(BERT_VITS2_EXE_NAME "bert-vits2-project" CACHE STRING "Output executable name")
 
-if(EXISTS "${BERT_VITS2_PROJECT_ROOT}/bin")
-    set(BERT_VITS2_OUTPUT_DIR "${BERT_VITS2_PROJECT_ROOT}/bin")
+if(WIN32)
+    set(BERT_VITS2_PLATFORM "windows")
+elseif(APPLE)
+    set(BERT_VITS2_PLATFORM "macos")
 else()
-    set(BERT_VITS2_OUTPUT_DIR "${BERT_VITS2_PROJECT_ROOT}/build-cl")
+    set(BERT_VITS2_PLATFORM "linux")
 endif()
+
+if(EXISTS "${BERT_VITS2_PROJECT_ROOT}/bin")
+    set(BERT_VITS2_OUTPUT_DIR "${BERT_VITS2_PROJECT_ROOT}/bin/${BERT_VITS2_PLATFORM}")
+else()
+    set(BERT_VITS2_OUTPUT_DIR "${BERT_VITS2_PROJECT_ROOT}/build-cl/${BERT_VITS2_PLATFORM}")
+endif()
+
+file(MAKE_DIRECTORY "${BERT_VITS2_OUTPUT_DIR}")
 
 include(Sentencepiece)
 include(OpenJtalk)
@@ -48,11 +59,23 @@ target_compile_definitions(${BERT_VITS2_EXE_NAME} PRIVATE BV2_WITH_CPPJIEBA=1)
 target_link_libraries(${BERT_VITS2_EXE_NAME} PRIVATE
     ${BERT_VITS2_SENTENCEPIECE_TARGET}
     ${BERT_VITS2_OPENJTALK_TARGET}
+    Threads::Threads
 )
 target_compile_definitions(${BERT_VITS2_EXE_NAME} PRIVATE BV2_WITH_OPENJTALK=1)
 target_include_directories(${BERT_VITS2_EXE_NAME} PRIVATE ${BERT_VITS2_OPENJTALK_INCLUDE_DIRS})
 if(WIN32)
     target_link_libraries(${BERT_VITS2_EXE_NAME} PRIVATE winmm ws2_32)
+elseif(UNIX AND NOT APPLE)
+    target_link_libraries(${BERT_VITS2_EXE_NAME} PRIVATE dl)
+    set_target_properties(${BERT_VITS2_EXE_NAME} PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+    )
+elseif(APPLE)
+    set_target_properties(${BERT_VITS2_EXE_NAME} PROPERTIES
+        BUILD_RPATH "@loader_path"
+        INSTALL_RPATH "@loader_path"
+    )
 endif()
 
 if(BERT_VITS2_WITH_ONNXRUNTIME)
@@ -61,8 +84,11 @@ if(BERT_VITS2_WITH_ONNXRUNTIME)
 
     if(NOT ONNXRUNTIME_FOUND)
         message(FATAL_ERROR
-            "ONNX Runtime was not found. Place a NuGet package under "
-            "third_party/onnxruntime-nuget or third_party/onnxruntime-gpu-windows-nuget, "
+            "ONNX Runtime was not found.\n"
+            "Windows: place a NuGet package under third_party/onnxruntime-nuget or "
+            "third_party/onnxruntime-gpu-windows-nuget.\n"
+            "Linux/macOS: extract the official release tarball to "
+            "third_party/onnxruntime-linux (or third_party/onnxruntime-gpu-linux), "
             "or configure with -DONNXRUNTIME_ROOT=/path/to/onnxruntime.")
     endif()
 
@@ -73,16 +99,8 @@ if(BERT_VITS2_WITH_ONNXRUNTIME)
     target_include_directories(${BERT_VITS2_EXE_NAME} PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
     target_link_libraries(${BERT_VITS2_EXE_NAME} PRIVATE ${ONNXRUNTIME_LIBRARY})
 
-    if(WIN32 AND ONNXRUNTIME_DLL_DIR)
-        file(GLOB _ort_dlls "${ONNXRUNTIME_DLL_DIR}/*.dll")
-        if(_ort_dlls)
-            add_custom_command(TARGET ${BERT_VITS2_EXE_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${_ort_dlls}
-                    "$<TARGET_FILE_DIR:${BERT_VITS2_EXE_NAME}>"
-                COMMENT "Copying ONNX Runtime DLLs to ${BERT_VITS2_OUTPUT_DIR}"
-            )
-        endif()
+    if(ONNXRUNTIME_DLL_DIR)
+        bert_vits2_copy_onnxruntime_libs(${BERT_VITS2_EXE_NAME} "${ONNXRUNTIME_DLL_DIR}")
     endif()
 endif()
 
@@ -113,6 +131,7 @@ target_compile_definitions(gen_jp_fixture PRIVATE BV2_WITH_CPPJIEBA=1 BV2_WITH_O
 target_link_libraries(gen_jp_fixture PRIVATE
     ${BERT_VITS2_SENTENCEPIECE_TARGET}
     ${BERT_VITS2_OPENJTALK_TARGET}
+    Threads::Threads
 )
 target_include_directories(gen_jp_fixture PRIVATE ${BERT_VITS2_OPENJTALK_INCLUDE_DIRS})
 if(MSVC)
@@ -140,6 +159,7 @@ target_compile_definitions(test_jp_frontend PRIVATE BV2_WITH_CPPJIEBA=1 BV2_WITH
 target_link_libraries(test_jp_frontend PRIVATE
     ${BERT_VITS2_SENTENCEPIECE_TARGET}
     ${BERT_VITS2_OPENJTALK_TARGET}
+    Threads::Threads
 )
 target_include_directories(test_jp_frontend PRIVATE ${BERT_VITS2_OPENJTALK_INCLUDE_DIRS})
 if(MSVC)
