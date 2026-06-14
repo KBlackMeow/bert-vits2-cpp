@@ -39,6 +39,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
 namespace {
 
 #ifdef _WIN32
@@ -85,6 +89,7 @@ struct Args {
     std::string host = "127.0.0.1";
     int port = 7860;
     bool device_set = false;
+    bool warmup = true;
 };
 
 std::map<std::string, int64_t> default_speaker_map() {
@@ -106,7 +111,7 @@ void usage(const char * exe) {
         << "  --server               run built-in HTTP server\n"
         << "  --host HOST            HTTP bind host, default 127.0.0.1\n"
         << "  --port N               HTTP port, default 7860\n"
-        << "  --device cpu|cuda      execution device, default auto in server mode, cpu otherwise\n"
+        << "  --device cpu|cuda|mlx  execution device, default auto (cuda on Windows/Linux when available, mlx on macOS, else cpu)\n"
         << "  --cuda-device N        CUDA device id, default 0\n"
         << "  --model-dir DIR        exported model directory, default onnx/model\n"
         << "  --config FILE          speaker config path, default <model-dir>/config.json\n"
@@ -129,6 +134,7 @@ void usage(const char * exe) {
         << "  --en-bert-spm FILE     English BERT SentencePiece model path\n"
         << "  --no-bert              disable automatic BERT for --text\n"
         << "  --no-split             disable automatic sentence chunking for --text\n"
+        << "  --no-warmup            skip server warm-up synthesis (faster startup, slow first request)\n"
         << "  --dump-spans           print language spans for MIX text and exit\n"
         << "  --max-chunk-chars N    max characters per text chunk, default 240\n"
         << "  --chunk-pause-ms N     silence between chunks, default 120\n"
@@ -175,6 +181,20 @@ std::string module_directory() {
     const size_t pos = exe.find_last_of("\\/");
     return pos == std::string::npos ? std::string{} : exe.substr(0, pos);
 }
+#elif defined(__APPLE__)
+std::string module_directory() {
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    if (size == 0) return {};
+    std::string raw(size, '\0');
+    if (_NSGetExecutablePath(raw.data(), &size) != 0) return {};
+    raw.resize(std::char_traits<char>::length(raw.c_str()));
+    char resolved[PATH_MAX];
+    const char * exe_path = realpath(raw.c_str(), resolved) ? resolved : raw.c_str();
+    const std::string exe(exe_path);
+    const size_t pos = exe.find_last_of('/');
+    return pos == std::string::npos ? std::string{} : exe.substr(0, pos);
+}
 #else
 std::string module_directory() {
     char buf[4096];
@@ -203,6 +223,9 @@ bool cuda_runtime_available() {
     HMODULE driver = LoadLibraryA("nvcuda.dll");
     if (driver) FreeLibrary(driver);
     return provider_ok && driver != nullptr;
+#elif defined(__APPLE__)
+    // macOS uses CoreML (MLX) instead of CUDA; never auto-select CUDA here.
+    return false;
 #else
     void * driver = dlopen("libcuda.so.1", RTLD_LAZY);
     if (!driver) driver = dlopen("libcuda.so", RTLD_LAZY);
@@ -232,6 +255,22 @@ bool cuda_runtime_available() {
     dlclose(cuda_provider);
     return true;
 #endif
+}
+
+// CoreML EP ships inside libonnxruntime on macOS; if we built against the
+// macOS ORT package it is always available at runtime.
+bool mlx_runtime_available() {
+#ifdef __APPLE__
+    return true;
+#else
+    return false;
+#endif
+}
+
+const char * device_label(const bv2::SynthesisOptions & options) {
+    if (options.use_cuda) return "cuda";
+    if (options.use_mlx) return "mlx";
+    return "cpu";
 }
 
 bv2::BertPaths bert_paths_from(const Args & args) {
@@ -561,19 +600,31 @@ Args parse_args(const std::vector<std::string> & argv) {
         else if (key == "--no-bert") args.auto_bert = false;
         else if (key == "--dump-spans") args.dump_spans = true;
         else if (key == "--no-split") args.split_text = false;
+        else if (key == "--no-warmup") args.warmup = false;
         else if (key == "--max-chunk-chars") args.max_chunk_chars = static_cast<size_t>(std::stoul(next(key)));
         else if (key == "--chunk-pause-ms") args.chunk_pause_ms = std::stoi(next(key));
         else if (key == "--device") {
             const std::string device = next(key);
             if (device == "cuda") {
                 args.options.use_cuda = true;
+                args.options.use_mlx = false;
                 args.device_set = true;
+            }
+            else if (device == "mlx") {
+#ifdef __APPLE__
+                args.options.use_mlx = true;
+                args.options.use_cuda = false;
+                args.device_set = true;
+#else
+                throw std::runtime_error("--device mlx is only supported on macOS");
+#endif
             }
             else if (device == "cpu") {
                 args.options.use_cuda = false;
+                args.options.use_mlx = false;
                 args.device_set = true;
             }
-            else throw std::runtime_error("--device must be cpu or cuda");
+            else throw std::runtime_error("--device must be cpu, cuda, or mlx");
         }
         else if (key == "--cuda-device") args.options.cuda_device_id = std::stoi(next(key));
         else if (key == "--emotion") args.emotion = next(key);
@@ -594,12 +645,22 @@ Args parse_args(const std::vector<std::string> & argv) {
         }
     }
 
-    if (args.server && !args.device_set) {
-        args.options.use_cuda = cuda_runtime_available();
+    if (!args.device_set) {
+#ifdef __APPLE__
+        // macOS default: CoreML (advertised as "mlx") if available, else CPU.
+        if (mlx_runtime_available()) {
+            args.options.use_mlx = true;
+        }
+#else
+        // Windows / Linux: auto-select CUDA in server mode when the provider and
+        // driver are present; otherwise leave use_cuda=false (CPU) for CLI runs.
+        if (args.server && cuda_runtime_available()) {
+            args.options.use_cuda = true;
+        }
+#endif
     }
     if (args.server) {
-        std::cout << "execution device: "
-                  << (args.options.use_cuda ? "cuda" : "cpu");
+        std::cout << "execution device: " << device_label(args.options);
         if (!args.device_set) std::cout << " (auto)";
         std::cout << "\n";
     }
@@ -627,6 +688,7 @@ Args parse_args(const std::vector<std::string> & argv) {
     args.paths.sdp = join_path(args.model_dir, args.prefix + "_sdp.onnx");
     args.paths.flow = join_path(args.model_dir, args.prefix + "_flow.onnx");
     args.paths.dec = join_path(args.model_dir, args.prefix + "_dec.onnx");
+    args.paths.config = args.config_path;   // user --config (may be empty)
     return args;
 }
 
@@ -703,6 +765,9 @@ void play_wav_file(const std::string & path) {
     }
 #else
     const std::string quoted = shell_quote(path);
+#ifdef __APPLE__
+    if (command_exists("afplay") && command_succeeds("afplay " + quoted)) return;
+#endif
     if (command_exists("paplay") && command_succeeds("paplay " + quoted)) return;
     if (command_exists("aplay") && command_succeeds("aplay -q " + quoted)) return;
     if (command_exists("ffplay") && command_succeeds("ffplay -nodisp -autoexit -loglevel quiet " + quoted)) return;
@@ -723,7 +788,7 @@ void play_wav_file(const std::string & path) {
         }
     }
     throw std::runtime_error(
-        "failed to play wav; install paplay/aplay/ffplay, use WSL powershell.exe audio, or pass -o to write a wav file: "
+        "failed to play wav; install afplay/paplay/aplay/ffplay, use WSL powershell.exe audio, or pass -o to write a wav file: "
         + path);
 #endif
 }
@@ -1196,7 +1261,7 @@ std::vector<std::string> build_argv_from_json(const std::string & body, const st
         argv.push_back(base_args.config_path);
     }
     argv.push_back("--device");
-    argv.push_back(base_args.options.use_cuda ? "cuda" : "cpu");
+    argv.push_back(device_label(base_args.options));
     argv.push_back("--cuda-device");
     argv.push_back(std::to_string(base_args.options.cuda_device_id));
     argv.push_back("--text");
@@ -1470,17 +1535,81 @@ void handle_http_client(SocketHandle client) {
 
 int run_http_server(const Args & args) {
     g_http_base_args = args;
-    std::cout << "preloading VITS ONNX sessions";
+    const char * backend_label = args.options.use_mlx
+        ? "MLX"
+        : (args.options.use_cuda ? "ONNX/CUDA" : "ONNX/CPU");
+    std::cout << "preloading VITS " << backend_label << " session";
     if (args.options.use_cuda) std::cout << " (cuda:" << args.options.cuda_device_id << ")";
-    else std::cout << " (cpu)";
     std::cout << "...\n";
     bv2::preload_synthesis_model(args.paths, args.options);
-    std::cout << "preloading BERT ONNX sessions...\n";
+    std::cout << "preloading BERT " << backend_label << " sessions...\n";
     bv2::preload_bert_models(bert_paths_from(args), args.options);
     if (bv2::openjtalk_available()) {
         std::cout << "openjtalk dictionary ready\n";
     }
     std::cout << "preload complete\n";
+
+    // Warm-up synthesis. Three things contribute to the cold first-request cost
+    // on Apple Silicon, only the first of which is what people usually mean by
+    // "JIT cache":
+    //   1. process-local MLX Metal pipeline cache (cleared on restart)
+    //   2. system-wide Apple Metal compiled-shader disk cache under
+    //      ~/Library/Caches/com.apple.metal/, populated by the OS the first
+    //      time any process compiles a given shader (persists, but is not
+    //      under our control)
+    //   3. CPU/GPU DVFS - after several seconds of idle the SoC drops to a low
+    //      P-state and needs ~10-20s of sustained load to return to peak. A
+    //      tiny warm-up payload doesn't push it up.
+    //
+    // To address all three we run synthesis on a payload whose chunk size
+    // matches `max_chunk_chars` (default 240 ZH chars). That hits the same
+    // VITS / BERT shapes the user's real requests will use and keeps the GPU
+    // busy long enough to spin DVFS up.
+    if (args.warmup && args.server) {
+        std::cout << "warming up synthesis pipelines...\n";
+        const auto warmup_t0 = std::chrono::steady_clock::now();
+        // A long ZH paragraph (~220 chars) covers the typical chunk size; the
+        // shorter ones cover edge cases (short queries, single-sentence calls).
+        const std::string long_zh =
+            "晚饭后我沿着河边一直走，看天色慢慢由蓝转紫，再由紫转灰。"
+            "桥上的灯一盏一盏亮起来，水面被切成很多细碎的金色。"
+            "有人在岸边吹笛，调子很慢，像在讲一个许久未提起的故事。"
+            "我停下来听了一会儿，又继续往前走。城市并不安静，但此刻却觉得心里很平。"
+            "也许长大后能记得的，并不是某一天发生的大事，"
+            "而是这样一个普通的夜晚，风很轻，路很长，不必着急去任何地方。";
+        const std::vector<std::pair<std::string, std::string>> warmup_jobs = {
+            {"ZH", "你好，这是一次测试"},
+            {"ZH", "今天天气不错，适合出门散步，听听风声和鸟叫，挺好的。"},
+            {"ZH", long_zh},
+        };
+        for (const auto & [lang, text] : warmup_jobs) {
+            Args wa = args;
+            wa.text = text;
+            wa.language = lang;
+            wa.split_text = false;
+            wa.auto_bert = true;
+            wa.out.clear();
+            wa.options.speaker_id = 0;
+            wa.speaker_set = true;
+            const auto job_t0 = std::chrono::steady_clock::now();
+            try {
+                SynthesisGate::Guard gate(g_synthesis_gate);
+                (void)synthesize_args(wa);
+            } catch (const std::exception & e) {
+                std::fprintf(stderr,
+                             "  [warmup] %zu chars skipped: %s\n",
+                             text.size(), e.what());
+                continue;
+            }
+            const auto job_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - job_t0).count();
+            std::cout << "  warmup " << text.size() << " bytes: "
+                      << job_ms << "ms\n";
+        }
+        const auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - warmup_t0).count();
+        std::cout << "warmup done (" << warmup_ms << "ms)\n";
+    }
 #ifdef _WIN32
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup failed");
@@ -1513,7 +1642,7 @@ int run_http_server(const Args & args) {
     }
 
     std::cout << "listening on http://" << args.host << ":" << args.port << "\n";
-    std::cout << "device: " << (args.options.use_cuda ? "cuda" : "cpu");
+    std::cout << "device: " << device_label(args.options);
     if (!args.device_set) std::cout << " (auto)";
     std::cout << "\n";
     std::cout << "example request: POST /tts with JSON {\"text\":\"hello\",\"language\":\"EN\"}\n";

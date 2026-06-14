@@ -12,6 +12,13 @@ find_package(Threads REQUIRED)
 
 option(BERT_VITS2_WITH_ONNXRUNTIME "Build ONNX Runtime based Bert-VITS2 inference" ON)
 
+# Apple Silicon native MLX backend (only built on macOS arm64).
+if(APPLE)
+    option(BERT_VITS2_WITH_MLX "Build native MLX inference backend (Apple Silicon)" ON)
+else()
+    option(BERT_VITS2_WITH_MLX "Build native MLX inference backend (Apple Silicon)" OFF)
+endif()
+
 set(BERT_VITS2_EXE_NAME "bert-vits2-project" CACHE STRING "Output executable name")
 
 if(WIN32)
@@ -34,6 +41,20 @@ include(Sentencepiece)
 include(OpenJtalk)
 include(CppJieba)
 
+set(BERT_VITS2_MLX_SOURCES "")
+if(BERT_VITS2_WITH_MLX)
+    list(APPEND BERT_VITS2_MLX_SOURCES
+        mlx/bv2_mlx_ops.cpp
+        mlx/bv2_mlx_modules.cpp
+        mlx/bv2_mlx_attentions.cpp
+        mlx/bv2_mlx_transforms.cpp
+        mlx/bv2_mlx_flow_modules.cpp
+        mlx/bv2_mlx_models.cpp
+        mlx/bv2_mlx_runtime.cpp
+        mlx/bv2_mlx_bert.cpp
+    )
+endif()
+
 add_executable(${BERT_VITS2_EXE_NAME}
     main.cpp
     bv2_tts.cpp
@@ -41,6 +62,7 @@ add_executable(${BERT_VITS2_EXE_NAME}
     bv2_sentencepiece.cpp
     bv2_zh_tone_sandhi.cpp
     bv2_zh_frontend.cpp
+    ${BERT_VITS2_MLX_SOURCES}
 )
 set_target_properties(${BERT_VITS2_EXE_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${BERT_VITS2_OUTPUT_DIR}"
@@ -72,6 +94,9 @@ elseif(UNIX AND NOT APPLE)
         INSTALL_RPATH "$ORIGIN"
     )
 elseif(APPLE)
+    # libonnxruntime.dylib already links CoreML.framework internally;
+    # the binary just needs an rpath next to the dylib that gets copied
+    # into ${BERT_VITS2_OUTPUT_DIR} by bert_vits2_copy_onnxruntime_libs().
     set_target_properties(${BERT_VITS2_EXE_NAME} PROPERTIES
         BUILD_RPATH "@loader_path"
         INSTALL_RPATH "@loader_path"
@@ -101,6 +126,20 @@ if(BERT_VITS2_WITH_ONNXRUNTIME)
 
     if(ONNXRUNTIME_DLL_DIR)
         bert_vits2_copy_onnxruntime_libs(${BERT_VITS2_EXE_NAME} "${ONNXRUNTIME_DLL_DIR}")
+    endif()
+endif()
+
+if(BERT_VITS2_WITH_MLX)
+    include(Mlx)
+    if(NOT BERT_VITS2_MLX_AVAILABLE)
+        message(STATUS "MLX backend disabled (only built on Apple Silicon)")
+    else()
+        message(STATUS "MLX backend enabled (target: ${BERT_VITS2_MLX_TARGET})")
+        target_compile_definitions(${BERT_VITS2_EXE_NAME} PRIVATE BV2_WITH_MLX=1)
+        target_include_directories(${BERT_VITS2_EXE_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/mlx
+        )
+        target_link_libraries(${BERT_VITS2_EXE_NAME} PRIVATE ${BERT_VITS2_MLX_TARGET})
     endif()
 endif()
 

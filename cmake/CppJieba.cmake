@@ -1,12 +1,20 @@
 include(FetchContent)
 
-if(NOT TARGET cppjieba)
+# Header-only library; avoid add_subdirectory so cppjieba's own install()
+# rules (which omit DESTINATION on newer CMake) don't fail our configure step.
+if(NOT DEFINED cppjieba_SOURCE_DIR OR NOT EXISTS "${cppjieba_SOURCE_DIR}/include/cppjieba/Jieba.hpp")
     FetchContent_Declare(
         cppjieba
         GIT_REPOSITORY https://github.com/yanyiwu/cppjieba.git
         GIT_TAG master
     )
-    FetchContent_MakeAvailable(cppjieba)
+    if(POLICY CMP0169)
+        cmake_policy(SET CMP0169 OLD)
+    endif()
+    FetchContent_GetProperties(cppjieba)
+    if(NOT cppjieba_POPULATED)
+        FetchContent_Populate(cppjieba)
+    endif()
 endif()
 
 set(BERT_VITS2_CPPJIEBA_INCLUDE "${cppjieba_SOURCE_DIR}/include")

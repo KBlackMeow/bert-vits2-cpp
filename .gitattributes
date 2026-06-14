@@ -1,0 +1,28 @@
+# Force LF on shell scripts so they stay runnable on macOS / Linux even when
+# checked out on Windows with core.autocrlf=true.
+*.sh           text eol=lf
+*.bash         text eol=lf
+
+# Other text formats: normalize to LF inside the repo.
+*.cpp          text eol=lf
+*.h            text eol=lf
+*.hpp          text eol=lf
+*.cmake        text eol=lf
+CMakeLists.txt text eol=lf
+*.py           text eol=lf
+*.md           text eol=lf
+*.json         text eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat          text eol=crlf
+*.cmd          text eol=crlf
+*.ps1          text eol=crlf
+
+# Binary assets — never touch.
+*.onnx         binary
+*.dll          binary
+*.so           binary
+*.dylib        binary
+*.exe          binary
+*.bin          binary
+*.wav          binary

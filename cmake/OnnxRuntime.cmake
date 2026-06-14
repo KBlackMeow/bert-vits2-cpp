@@ -22,6 +22,32 @@ function(bert_vits2_copy_onnxruntime_libs target dll_dir)
         set(_lib_ext "so")
     endif()
 
+    if(APPLE)
+        file(GLOB _ort_apple_libs
+            "${dll_dir}/libonnxruntime*.${_lib_ext}"
+        )
+        foreach(_src IN LISTS _ort_apple_libs)
+            get_filename_component(_name "${_src}" NAME)
+            if(IS_SYMLINK "${_src}")
+                file(READ_SYMLINK "${_src}" _target_name)
+                get_filename_component(_target_name "${_target_name}" NAME)
+                add_custom_command(TARGET ${target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E rm -f "$<TARGET_FILE_DIR:${target}>/${_name}"
+                    COMMAND ${CMAKE_COMMAND} -E create_symlink
+                        "${_target_name}" "$<TARGET_FILE_DIR:${target}>/${_name}"
+                    COMMENT "Symlink ${_name} -> ${_target_name}"
+                )
+            else()
+                add_custom_command(TARGET ${target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_src}" "$<TARGET_FILE_DIR:${target}>/${_name}"
+                    COMMENT "Copy ${_name} next to ${target}"
+                )
+            endif()
+        endforeach()
+        return()
+    endif()
+
     file(GLOB _ort_real_libs
         "${dll_dir}/libonnxruntime*.${_lib_ext}.*"
         "${dll_dir}/libonnxruntime*.${_lib_ext}"
@@ -85,10 +111,19 @@ function(bert_vits2_find_onnxruntime project_root)
     endif()
 
     if(NOT _include_dir OR NOT _library)
-        set(_local_roots
-            "${project_root}/third_party/onnxruntime-linux"
-            "${project_root}/third_party/onnxruntime-gpu-linux"
-        )
+        if(APPLE)
+            set(_local_roots
+                "${project_root}/third_party/onnxruntime-osx-arm64"
+                "${project_root}/third_party/onnxruntime-osx-x86_64"
+                "${project_root}/third_party/onnxruntime-osx"
+                "${project_root}/third_party/onnxruntime-macos"
+            )
+        else()
+            set(_local_roots
+                "${project_root}/third_party/onnxruntime-linux"
+                "${project_root}/third_party/onnxruntime-gpu-linux"
+            )
+        endif()
         foreach(_root IN LISTS _local_roots)
             unset(_include_dir)
             unset(_library)

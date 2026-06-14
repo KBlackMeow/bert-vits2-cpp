@@ -3,15 +3,26 @@ build/
 build-cl/
 build-linux/
 build-linux-test/
+build-macos/
 # platform-segregated: bin/windows/, bin/linux/, bin/macos/
 bin/
 output/
 
+# OS metadata
+.DS_Store
+
 # Model weights & ONNX Runtime packages (download or export separately)
 onnx/
+model/
+mlx_model/
+third_party/Bert-VITS2/
 third_party/onnxruntime-gpu-windows-nuget/
 third_party/onnxruntime-nuget/
 third_party/onnxruntime-linux/
 third_party/onnxruntime-gpu-linux/
 third_party/onnxruntime-linux-nuget/
 third_party/onnxruntime-gpu-linux-nuget/
+third_party/onnxruntime-osx-arm64/
+third_party/onnxruntime-osx-x86_64/
+third_party/onnxruntime-osx/
+third_party/onnxruntime-macos/

@@ -25,6 +25,14 @@ Write a wav file instead:
 .\bin\windows\bert-vits2-project.exe --text "你好，这是测试。" --language ZH --speaker-name keqing_zh --device cuda -o output\out_cuda.wav
 ```
 
+Supported `--device` values per platform:
+
+| Platform | `cpu` | `cuda` | `mlx` | Default |
+|----------|-------|--------|-------|---------|
+| Windows  | yes   | yes (with CUDA + cuDNN bundled / installed) | — | `cuda` in `--server` if available, else `cpu` |
+| Linux    | yes   | yes (with `libcuda.so.1` + ORT GPU provider) | — | `cuda` in `--server` if available, else `cpu` |
+| macOS    | yes   | — | yes (ONNX Runtime **CoreML** EP → Apple Neural Engine / GPU / CPU) | **`mlx`** |
+
 When `-o` or `--output` is omitted, the program writes a temporary wav, plays it
 with the Windows audio API, and then removes the temporary file.
 
@@ -368,6 +376,19 @@ preloading VITS ONNX sessions (cuda:0)...
 device: cuda
 ```
 
+Strip a previously bundled CUDA folder back down (inverse of
+`bundle_cuda_linux.sh`):
+
+```bash
+# Drop CUDA Toolkit + cuDNN libs only; keep libonnxruntime_providers_cuda.so
+# so a host-installed CUDA + cuDNN can still drive --device cuda (~700 MB).
+bash scripts/strip_cuda_linux.sh
+
+# Also drop the ORT CUDA / TensorRT providers for a fully CPU-only deployment
+# (drops bin/linux/ to ~20 MB; --device cuda will fail at runtime).
+bash scripts/strip_cuda_linux.sh --drop-ort-cuda
+```
+
 Manual ONNX Runtime setup (instead of the fetch script):
 
 ```bash
@@ -377,3 +398,143 @@ tar -xzf ort.tgz -C third_party/onnxruntime-linux --strip-components=1
 cmake -B build-linux -S . -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT=$PWD/third_party/onnxruntime-linux
 cmake --build build-linux -j$(nproc)
 ```
+
+## macOS (Apple Silicon, CPU + MLX)
+
+`--device mlx` on macOS now uses a **native Apple MLX C++ backend**
+(`src/mlx/`) when the binary was built with `BERT_VITS2_WITH_MLX=ON`
+(default on Apple Silicon). The backend re-implements Bert-VITS2 v2.3's
+`SynthesizerTrn` directly in MLX C++ ops so inference dispatches to the
+Apple GPU via Metal. Unsupported tensor shapes / dtypes fall back to
+MLX's CPU kernels automatically.
+
+If MLX wasn't compiled in, `--device mlx` falls back to the legacy
+ONNX Runtime CoreML execution provider so existing scripts keep working.
+
+`mlx` is the **default device on macOS**; pass `--device cpu` to force
+pure-CPU inference for comparison or debugging.
+
+### One-time setup: convert all checkpoints to MLX safetensors
+
+The MLX backend reads weights from a flat `mlx_model/` directory parallel to
+the existing `onnx/` tree:
+
+```
+mlx_model/
+├── G_mlx.safetensors                                     # main VITS generator
+└── bert/
+    ├── chinese-roberta-wwm-ext-large.safetensors          # ZH BERT-large
+    ├── deberta-v2-large-japanese-char-wwm.safetensors     # JP DeBERTa-v2
+    └── deberta-v3-large.safetensors                       # EN DeBERTa-v3
+```
+
+`config.json` (speakers / sampling rate / model hyper-parameters) is reused
+from `onnx/model/config.json` (or `model/config.json`); no copy needed.
+
+```bash
+python -m pip install torch safetensors transformers
+
+# 1) VITS generator (folds weight_norm, drops training-only modules)
+python src/convert_to_mlx.py model/models/G_46000.pth \
+    -o mlx_model/G_mlx.safetensors --strict
+
+# 2) Three BERT / DeBERTa feature extractors
+python src/convert_bert_to_mlx.py model/bert/chinese-roberta-wwm-ext-large \
+    -o mlx_model/bert/chinese-roberta-wwm-ext-large.safetensors
+
+python src/convert_bert_to_mlx.py model/bert/deberta-v2-large-japanese-char-wwm \
+    -o mlx_model/bert/deberta-v2-large-japanese-char-wwm.safetensors
+
+python src/convert_bert_to_mlx.py model/bert/deberta-v3-large \
+    -o mlx_model/bert/deberta-v3-large.safetensors
+```
+
+What the BERT converter does: strip the masked-LM head + pooler, normalise
+HF state-dict keys (`bert.*`, `roberta.*`, `deberta.*` → bare names), and
+stash architecture hyper-parameters (kind, hidden size, layer count,
+relative-attention switches, …) inside safetensors metadata so the C++
+runtime needs no separate `config.json` for the BERT models. The runtime
+also only executes the first 22 of 24 layers it actually needs
+(`hidden_states[-3]`).
+
+If a `.safetensors` file is missing the MLX backend errors with the exact
+paths it tried; the legacy `onnx/...` location is also accepted as a
+fallback. Without `--device mlx` the binary keeps using the ONNX Runtime +
+CoreML path as before.
+
+Install build tools:
+
+```bash
+brew install cmake ninja
+```
+
+One-shot build (downloads the macOS ONNX Runtime release, configures, builds,
+runs the JP frontend regression test):
+
+```bash
+bash scripts/build_macos.sh
+```
+
+Or step by step:
+
+```bash
+bash scripts/fetch_onnxruntime_macos.sh        # third_party/onnxruntime-osx-arm64
+cmake -B build-macos -S . -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+    -DONNXRUNTIME_ROOT=$PWD/third_party/onnxruntime-osx-arm64
+cmake --build build-macos -j$(sysctl -n hw.ncpu)
+```
+
+The build writes `bin/macos/bert-vits2-project` plus
+`libonnxruntime.1.20.1.dylib` and a `libonnxruntime.dylib` symlink next to
+the executable. RPATH is set to `@loader_path`, so the binary finds its
+ONNX Runtime dylib without `DYLD_LIBRARY_PATH`.
+
+Run from the project root so relative model and frontend paths resolve:
+
+```bash
+./bin/macos/bert-vits2-project --text "你好，这是测试。" --language ZH --speaker-name keqing_zh
+./bin/macos/bert-vits2-project --text "Hello, world." --language EN --speaker-name keqing_en -o output/out.wav
+./bin/macos/bert-vits2-project --text "こんにちは、世界。" --language JP --speaker-name tachibana_ja
+./bin/macos/bert-vits2-project --text "你好，Hello，こんにちは。" --language AUTO --speaker-name keqing_zh -o output/mix.wav
+
+# explicit device selection
+./bin/macos/bert-vits2-project --text "你好" --language ZH --device cpu -o output/cpu.wav
+./bin/macos/bert-vits2-project --text "你好" --language ZH --device mlx -o output/mlx.wav
+```
+
+When `-o` is omitted, audio is played with `afplay` (built into macOS); the
+fallbacks `paplay` / `aplay` / `ffplay` are still tried in case you have them
+installed via Homebrew. Use `-o` to write a wav file instead.
+
+HTTP server:
+
+```bash
+./bin/macos/bert-vits2-project --server --host 127.0.0.1 --port 7860              # default device = mlx
+./bin/macos/bert-vits2-project --server --device cpu                              # force CPU
+```
+
+API examples (same shape as Windows / Linux):
+
+```bash
+curl -X POST http://127.0.0.1:7860/tts \
+    -H "Content-Type: application/json" \
+    -d '{"text":"你好，这是接口测试。","language":"ZH","speaker_name":"keqing_zh"}' \
+    --output output/api_test.wav
+
+curl -N -X POST http://127.0.0.1:7860/tts/stream \
+    -H "Content-Type: application/json" \
+    -d '{"text":"你好，这是流式测试。","language":"ZH","speaker_name":"keqing_zh"}' \
+    --output output/stream.pcm
+```
+
+Performance notes:
+
+- The first request after preload pays a one-time CoreML model-compilation
+  cost (a few seconds per ONNX session). In `--server` mode this happens once
+  during `preloading VITS ONNX sessions (mlx)...` / `preloading BERT ONNX
+  sessions...` and all subsequent requests reuse the compiled CoreML model.
+- For one-shot CLI invocations on short utterances, `--device cpu` may
+  finish first because CPU inference avoids the CoreML compile step. `mlx`
+  wins decisively for longer text and for any server / batch workload.

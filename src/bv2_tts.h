@@ -34,6 +34,11 @@ struct ModelPaths {
     std::string sdp;
     std::string flow;
     std::string dec;
+    // Optional. Used by the MLX backend to resolve the VITS hyper-parameter
+    // file. When empty, `resolve_mlx_vits_files` falls back to
+    // `mlx_model/config.json` and `<onnx-dir>/config.json`. Set this to the
+    // CLI `--config` so user overrides win.
+    std::string config;
 };
 
 struct BertPaths {
@@ -57,6 +62,8 @@ struct SynthesisOptions {
     bool use_emotion = false;
     bool use_cuda = false;
     int cuda_device_id = 0;
+    // macOS CoreML execution provider (exposed as "MLX" device on macOS).
+    bool use_mlx = false;
 };
 
 TextFeatures text_to_sequence(const std::string & text, const std::string & language);

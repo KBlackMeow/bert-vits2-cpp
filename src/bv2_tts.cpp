@@ -8,6 +8,8 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -16,6 +18,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -30,6 +33,14 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef __APPLE__
+#include <coreml_provider_factory.h>
+#endif
+#endif
+
+#ifdef BV2_WITH_MLX
+#include "mlx/bv2_mlx_runtime.h"
+#include "mlx/bv2_mlx_bert.h"
 #endif
 
 namespace bv2 {
@@ -37,6 +48,246 @@ namespace {
 
 constexpr int64_t kBertDim = 1024;
 constexpr int64_t kEmotionDim = 512;
+
+#ifdef BV2_WITH_MLX
+// Singleton-cache of MlxVitsRuntime keyed by the resolved safetensors path.
+// The MLX runtime owns its weights and the per-graph compiled kernels, so we
+// reuse the same instance across calls.
+std::string mlx_model_dir_from_paths(const ModelPaths & paths) {
+    const std::string & enc = paths.enc;
+    const auto pos = enc.find_last_of("/\\");
+    if (pos == std::string::npos) return ".";
+    return enc.substr(0, pos);
+}
+
+bool file_exists(const std::string & p) {
+    std::ifstream probe(p);
+    return probe.good();
+}
+
+// Decide where the converted MLX weights and config live.
+//
+// Weights preference order:
+//   1. `mlx_model/G_mlx.safetensors`          (preferred new layout)
+//   2. `<onnx-model-dir>/G_mlx.safetensors`   (legacy layout, next to ONNX)
+//
+// Config preference order (must contain the FULL VITS hyper-params, i.e. the
+// training-time `config.json` -- the stripped speaker-only file at
+// `onnx/model/config.json` is not enough):
+//   1. `paths.config` (CLI `--config`) when non-empty AND the file exists
+//   2. `mlx_model/config.json`
+//   3. `<onnx-model-dir>/config.json`            (often only has spk2id)
+//   4. `model/config.json`                       (the usual training output)
+std::pair<std::string, std::string> resolve_mlx_vits_files(
+    const ModelPaths & paths) {
+    const std::string onnx_dir = mlx_model_dir_from_paths(paths);
+
+    // --- Weights ---
+    std::vector<std::string> weight_candidates = {
+        "mlx_model/G_mlx.safetensors",
+        onnx_dir + "/G_mlx.safetensors",
+    };
+    std::string st_path;
+    for (const auto & c : weight_candidates) {
+        if (file_exists(c)) { st_path = c; break; }
+    }
+    if (st_path.empty()) {
+        throw std::runtime_error(
+            "MLX VITS weights not found. Tried " + weight_candidates[0]
+            + " and " + weight_candidates[1] + ". Run: "
+            "python src/convert_to_mlx.py model/models/G_<step>.pth "
+            "-o mlx_model/G_mlx.safetensors --strict");
+    }
+
+    // --- Config ---
+    std::vector<std::string> cfg_candidates;
+    if (!paths.config.empty()) cfg_candidates.push_back(paths.config);
+    cfg_candidates.push_back("mlx_model/config.json");
+    cfg_candidates.push_back(onnx_dir + "/config.json");
+    cfg_candidates.push_back("model/config.json");
+
+    std::string cfg_path;
+    for (const auto & c : cfg_candidates) {
+        if (file_exists(c)) { cfg_path = c; break; }
+    }
+    if (cfg_path.empty()) {
+        std::string tried;
+        for (const auto & c : cfg_candidates) {
+            if (!tried.empty()) tried += ", ";
+            tried += c;
+        }
+        throw std::runtime_error(
+            "MLX VITS config.json not found. Tried: " + tried
+            + ". Pass --config <path-to-training-config.json>.");
+    }
+    return {st_path, cfg_path};
+}
+
+std::shared_ptr<bv2::mlx_rt::MlxVitsRuntime> cached_mlx_runtime(
+    const ModelPaths & paths,
+    const SynthesisOptions & /*options*/) {
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<bv2::mlx_rt::MlxVitsRuntime>> cache;
+    auto [st_path, cfg_path] = resolve_mlx_vits_files(paths);
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(st_path);
+    if (it != cache.end()) return it->second;
+    auto rt = std::make_shared<bv2::mlx_rt::MlxVitsRuntime>();
+    std::string err;
+    if (!rt->load_files(st_path, cfg_path, &err)) {
+        throw std::runtime_error(err);
+    }
+    cache[st_path] = rt;
+    return rt;
+}
+
+// ----- MLX BERT runtime, keyed on the (resolved) safetensors path. -----
+//
+// The CLI hands us a `--*-bert-model` ONNX path (default
+// `onnx/bert/chinese-roberta-wwm-ext-large_fp16.onnx`). For MLX inference
+// we look up a sibling safetensors. Preference order:
+//
+//   1. `mlx_model/bert/<base sans `_fp16`>.safetensors`     (new layout)
+//   2. `mlx_model/<base sans `_fp16`>.safetensors`          (flat fallback)
+//   3. `<onnx-dir>/<base>.safetensors`                       (legacy: next to ONNX)
+//   4. `<onnx-dir>/<base>_mlx.safetensors`
+//   5. `<onnx-dir>/<base sans `_fp16`>.safetensors`
+//
+// `src/convert_bert_to_mlx.py` writes form (1) by default.
+std::shared_ptr<bv2::mlx_rt::BertRuntime> cached_mlx_bert(
+    const std::string & onnx_path,
+    const SynthesisOptions & /*options*/) {
+    auto split_dir_basename = [](const std::string & p)
+        -> std::pair<std::string, std::string> {
+        auto slash = p.find_last_of("/\\");
+        if (slash == std::string::npos) return {".", p};
+        return {p.substr(0, slash), p.substr(slash + 1)};
+    };
+    auto strip_ext = [](const std::string & p) {
+        auto dot = p.find_last_of('.');
+        if (dot == std::string::npos) return p;
+        return p.substr(0, dot);
+    };
+    auto strip_quant_suffix = [](const std::string & p) {
+        static const std::vector<std::string> tails = {
+            "_fp16", "_fp32", "_int8", "_q8", "_q4",
+        };
+        for (const auto & t : tails) {
+            if (p.size() > t.size() &&
+                p.compare(p.size() - t.size(), t.size(), t) == 0) {
+                return p.substr(0, p.size() - t.size());
+            }
+        }
+        return p;
+    };
+    auto [onnx_dir, file] = split_dir_basename(onnx_path);
+    const std::string base = strip_ext(file);              // basename only
+    const std::string base_clean = strip_quant_suffix(base);
+
+    std::vector<std::string> candidates = {
+        "mlx_model/bert/" + base_clean + ".safetensors",
+        "mlx_model/" + base_clean + ".safetensors",
+        onnx_dir + "/" + base + ".safetensors",
+        onnx_dir + "/" + base + "_mlx.safetensors",
+    };
+    if (base_clean != base) {
+        candidates.push_back(onnx_dir + "/" + base_clean + ".safetensors");
+        candidates.push_back(onnx_dir + "/" + base_clean + "_mlx.safetensors");
+    }
+
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<bv2::mlx_rt::BertRuntime>> cache;
+
+    std::string resolved;
+    for (const auto & c : candidates) {
+        if (file_exists(c)) { resolved = c; break; }
+    }
+    if (resolved.empty()) {
+        std::string tried;
+        for (const auto & c : candidates) {
+            if (!tried.empty()) tried += ", ";
+            tried += c;
+        }
+        throw std::runtime_error(
+            "MLX BERT weights not found for '" + onnx_path + "' (tried: "
+            + tried + "). Run: python src/convert_bert_to_mlx.py "
+            "model/bert/" + base_clean + " -o "
+            + candidates.front());
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(resolved);
+    if (it != cache.end()) return it->second;
+    auto rt = std::make_shared<bv2::mlx_rt::BertRuntime>();
+    std::string err;
+    if (!rt->load(resolved, &err)) throw std::runtime_error(err);
+    cache[resolved] = rt;
+    return rt;
+}
+
+Tensor mlx_bert_feature(
+    const std::string & resolved_onnx_path,
+    const std::vector<int64_t> & input_ids,
+    const std::vector<int64_t> & token_type_ids_or_empty,
+    const std::vector<int64_t> & word2ph,
+    int64_t phone_count,
+    const SynthesisOptions & options) {
+    auto rt = cached_mlx_bert(resolved_onnx_path, options);
+    bv2::mlx_rt::BertInferInputs in;
+    in.input_ids      = input_ids;
+    in.token_type_ids = token_type_ids_or_empty;
+    in.word2ph        = word2ph;
+    in.phone_count    = phone_count;
+    std::string err;
+    auto out = rt->infer(in, &err);
+    if (!err.empty()) throw std::runtime_error(err);
+    // `zeros_bert(phones)` is laid out [phones, kBertDim] row-major, so
+    // mirror that here.
+    Tensor t({phone_count, static_cast<int64_t>(rt->hidden_size())});
+    t.data = std::move(out.bert_features);
+    return t;
+}
+
+std::vector<float> synthesize_with_mlx(
+    const ModelPaths & paths,
+    const TextFeatures & text,
+    const SynthesisOptions & options,
+    const Tensor * bert_zh,
+    const Tensor * bert_jp,
+    const Tensor * bert_en) {
+    auto rt = cached_mlx_runtime(paths, options);
+    bv2::mlx_rt::MlxInferInputs in;
+    in.phones    = text.phones;
+    in.tones     = text.tones;
+    in.languages = text.languages;
+    const int64_t tx = static_cast<int64_t>(text.phones.size());
+
+    auto fill_bert = [&](const Tensor * src, std::vector<float> & dst) {
+        if (src && !src->data.empty()) {
+            dst = src->data;
+            return;
+        }
+        dst.assign(static_cast<size_t>(tx) * kBertDim, 0.0f);
+    };
+    fill_bert(bert_zh, in.bert_zh);
+    fill_bert(bert_jp, in.bert_jp);
+    fill_bert(bert_en, in.bert_en);
+
+    in.speaker_id    = static_cast<int>(options.speaker_id);
+    in.sdp_ratio     = options.sdp_ratio;
+    in.noise_scale   = options.noise_scale;
+    in.noise_scale_w = options.noise_scale_w;
+    in.length_scale  = options.length_scale;
+    in.seed          = options.seed;
+
+    std::string err;
+    auto audio = rt->infer(in, &err);
+    if (audio.empty() && !err.empty()) {
+        throw std::runtime_error(err);
+    }
+    return audio;
+}
+#endif // BV2_WITH_MLX
 
 } // namespace
 
@@ -924,12 +1175,154 @@ Tensor matmul_attn(const Tensor & attn, const Tensor & value) {
     return out;
 }
 
+int env_int(const char * name, int default_value) {
+    const char * value = std::getenv(name);
+    if (!value || value[0] == '\0') return default_value;
+    try { return std::stoi(value); } catch (...) { return default_value; }
+}
+
+// Pick a sensible default thread count for the ORT CPU EP. Apple Silicon (M
+// series), AMD64 and Linux x86_64 all benefit from running matmul/conv across
+// multiple cores; ORT defaults to 1 unless told otherwise.
+//
+// Heuristic: use up to 8 threads, capped at hardware_concurrency(). Cap of 8
+// avoids over-subscription on big-core machines (perf+efficiency on M3 Max =
+// 16) where past ~8 threads memory bandwidth becomes the bottleneck for
+// VITS/BERT inference. Override with BV2_NUM_THREADS=N (any positive int).
+int default_intra_op_threads() {
+    const int hc = static_cast<int>(std::thread::hardware_concurrency());
+    if (hc <= 0) return 1;
+    return std::min(hc, 8);
+}
+
+int resolve_intra_op_threads() {
+    return env_int("BV2_NUM_THREADS", default_intra_op_threads());
+}
+
+// Inter-op parallelism (between independent subgraphs of one session). Most
+// VITS/BERT graphs are mostly linear so the win is small; default 1 keeps
+// behaviour predictable. Set BV2_INTER_OP_THREADS > 1 + BV2_PARALLEL=1 to
+// experiment.
+int resolve_inter_op_threads() {
+    return env_int("BV2_INTER_OP_THREADS", 1);
+}
+
+bool resolve_parallel_execution() {
+    return env_int("BV2_PARALLEL", 0) != 0;
+}
+
 #ifdef BV2_WITH_ONNXRUNTIME
-void configure_execution_provider(Ort::SessionOptions & opts, const SynthesisOptions & options) {
-    if (!options.use_cuda) return;
-    OrtCUDAProviderOptions cuda_options{};
-    cuda_options.device_id = options.cuda_device_id;
-    opts.AppendExecutionProvider_CUDA(cuda_options);
+
+void apply_session_threading(Ort::SessionOptions & opts) {
+    opts.SetIntraOpNumThreads(resolve_intra_op_threads());
+    const int inter_op = resolve_inter_op_threads();
+    if (inter_op > 1) opts.SetInterOpNumThreads(inter_op);
+    if (resolve_parallel_execution()) {
+        opts.SetExecutionMode(ORT_PARALLEL);
+    }
+}
+
+// Identify ONNX sessions so we can opt specific ones out of the GPU/Apple EP
+// when those models are known to mis-compile or trigger EP bugs.
+enum class SessionRole {
+    kGeneric = 0,
+    kVitsEnc,
+    kVitsEmb,
+    kVitsDp,
+    kVitsSdp,
+    kVitsFlow,   // GatherElements rank bug on CoreML NeuralNetwork EP.
+    kVitsDec,
+    kBert,
+};
+
+#ifdef __APPLE__
+bool env_truthy(const char * name, bool default_value) {
+    const char * value = std::getenv(name);
+    if (!value || value[0] == '\0') return default_value;
+    if (value[0] == '0' && value[1] == '\0') return false;
+    if (value[0] == '1' && value[1] == '\0') return true;
+    return default_value;
+}
+
+bool coreml_skips_role(SessionRole role) {
+    // CoreML EP (NeuralNetwork backend) mis-handles tensor rank inference for
+    // VITS-style graphs with dynamic shapes. Symptoms reported by ORT CPU EP
+    // downstream of CoreML-handled VITS subgraphs:
+    //   "GatherElements op: Rank of input 'data' needs to be equal to rank of
+    //    input 'indices'".
+    // Even isolating flow.onnx to the CPU EP is not enough, because the bad
+    // rank originates in upstream VITS sessions (enc/emb/dp/sdp/dec) running
+    // on CoreML.
+    //
+    // Default policy: keep all 6 VITS sessions on the ORT CPU EP (stable,
+    // fast: ~10 s for a 1500-char ZH paragraph on Apple Silicon). Route the
+    // 3 BERT sessions (chinese-roberta, deberta-jp, deberta-v3) to CoreML;
+    // they're the dominant cost in cold synthesis and don't trigger the
+    // rank-inference bug.
+    //
+    // Env overrides for experimentation:
+    //   BV2_COREML_VITS=1       Route all VITS sessions through CoreML (may
+    //                           trigger GatherElements rank errors).
+    //   BV2_COREML_FLOW=1       Route only flow through CoreML.
+    //   BV2_COREML_BERT=0       Keep BERT sessions on CPU EP too.
+    //   BV2_COREML_MLPROGRAM=1  Use MLProgram backend (slower per-process
+    //                           preload; better shape inference if you want
+    //                           to try BV2_COREML_VITS=1 in combination).
+    switch (role) {
+        case SessionRole::kBert:
+            return !env_truthy("BV2_COREML_BERT", true);
+        case SessionRole::kVitsFlow:
+            if (env_truthy("BV2_COREML_FLOW", false)) return false;
+            return !env_truthy("BV2_COREML_VITS", false);
+        case SessionRole::kVitsEnc:
+        case SessionRole::kVitsEmb:
+        case SessionRole::kVitsDp:
+        case SessionRole::kVitsSdp:
+        case SessionRole::kVitsDec:
+            return !env_truthy("BV2_COREML_VITS", false);
+        case SessionRole::kGeneric:
+            return false;
+    }
+    return false;
+}
+#endif
+
+void configure_execution_provider(
+    Ort::SessionOptions & opts,
+    const SynthesisOptions & options,
+    SessionRole role = SessionRole::kGeneric) {
+    if (options.use_cuda) {
+        OrtCUDAProviderOptions cuda_options{};
+        cuda_options.device_id = options.cuda_device_id;
+        opts.AppendExecutionProvider_CUDA(cuda_options);
+        return;
+    }
+#ifdef __APPLE__
+    if (options.use_mlx) {
+        if (coreml_skips_role(role)) {
+            // Stay on the ORT CPU EP for this session.
+            return;
+        }
+        // CoreML EP routes ops through Apple Neural Engine / GPU / CPU.
+        // - USE_CPU_AND_GPU: pick CPU+GPU compute units; ANE is excluded
+        //   because it occasionally lowers throughput / hits unsupported ops
+        //   on VITS exports. Override with BV2_COREML_USE_ANE=1 to allow ANE.
+        // - CREATE_MLPROGRAM: opt-in via BV2_COREML_MLPROGRAM=1. The modern
+        //   MLProgram backend has better shape inference but pays a per-process
+        //   model-compile cost; default is the legacy NeuralNetwork backend.
+        uint32_t coreml_flags = 0;
+        if (env_truthy("BV2_COREML_MLPROGRAM", false)) {
+            coreml_flags |= COREML_FLAG_CREATE_MLPROGRAM;
+        }
+        if (!env_truthy("BV2_COREML_USE_ANE", false)) {
+            coreml_flags |= COREML_FLAG_USE_CPU_AND_GPU;
+        }
+        Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CoreML(opts, coreml_flags));
+        return;
+    }
+#else
+    (void)role;
+#endif
 }
 
 #ifdef _WIN32
@@ -954,7 +1347,6 @@ Ort::Session load_session(Ort::Env & env, Ort::SessionOptions & opts, const std:
 
 struct OrtBundle {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "bert-vits2-cpp"};
-    Ort::SessionOptions opts;
     Ort::Session enc{nullptr};
     Ort::Session emb{nullptr};
     Ort::Session dp{nullptr};
@@ -962,19 +1354,34 @@ struct OrtBundle {
     Ort::Session flow{nullptr};
     Ort::Session dec{nullptr};
 
-    OrtBundle(const ModelPaths & paths, const SynthesisOptions & options) {
-        opts.SetIntraOpNumThreads(1);
+    static Ort::SessionOptions make_session_opts(const SynthesisOptions & options, SessionRole role) {
+        Ort::SessionOptions opts;
+        apply_session_threading(opts);
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         opts.SetLogSeverityLevel(3);
-        configure_execution_provider(opts, options);
-        enc = load_session(env, opts, paths.enc);
-        emb = load_session(env, opts, paths.emb);
-        dp = load_session(env, opts, paths.dp);
-        sdp = load_session(env, opts, paths.sdp);
-        flow = load_session(env, opts, paths.flow);
-        dec = load_session(env, opts, paths.dec);
+        configure_execution_provider(opts, options, role);
+        return opts;
+    }
+
+    OrtBundle(const ModelPaths & paths, const SynthesisOptions & options) {
+        auto load = [&](const std::string & path, SessionRole role) {
+            auto opts = make_session_opts(options, role);
+            return load_session(env, opts, path);
+        };
+        enc  = load(paths.enc,  SessionRole::kVitsEnc);
+        emb  = load(paths.emb,  SessionRole::kVitsEmb);
+        dp   = load(paths.dp,   SessionRole::kVitsDp);
+        sdp  = load(paths.sdp,  SessionRole::kVitsSdp);
+        flow = load(paths.flow, SessionRole::kVitsFlow);
+        dec  = load(paths.dec,  SessionRole::kVitsDec);
     }
 };
+
+const char * device_tag(const SynthesisOptions & options) {
+    if (options.use_cuda) return "cuda";
+    if (options.use_mlx) return "mlx";
+    return "cpu";
+}
 
 std::string model_cache_key(const ModelPaths & paths, const SynthesisOptions & options) {
     std::ostringstream ss;
@@ -984,7 +1391,7 @@ std::string model_cache_key(const ModelPaths & paths, const SynthesisOptions & o
        << paths.sdp << '|'
        << paths.flow << '|'
        << paths.dec << '|'
-       << (options.use_cuda ? "cuda" : "cpu") << '|'
+       << device_tag(options) << '|'
        << options.cuda_device_id;
     return ss.str();
 }
@@ -1007,10 +1414,10 @@ struct BertSessionCache {
     Ort::Session session{nullptr};
 
     BertSessionCache(const std::string & path, const SynthesisOptions & options) {
-        opts.SetIntraOpNumThreads(1);
+        apply_session_threading(opts);
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         opts.SetLogSeverityLevel(3);
-        configure_execution_provider(opts, options);
+        configure_execution_provider(opts, options, SessionRole::kBert);
         session = load_session(env, opts, path);
     }
 };
@@ -1018,7 +1425,7 @@ struct BertSessionCache {
 std::string bert_cache_key(const std::string & path, const SynthesisOptions & options) {
     std::ostringstream ss;
     ss << path << '|'
-       << (options.use_cuda ? "cuda" : "cpu") << '|'
+       << device_tag(options) << '|'
        << options.cuda_device_id;
     return ss.str();
 }
@@ -1501,6 +1908,84 @@ std::map<std::string, int64_t> load_vocab_map(const std::string & vocab_path) {
     return cache.at(vocab_path);
 }
 
+// FNV-1a 64-bit hash over a contiguous byte range; good enough for an
+// in-memory BERT feature cache key (no security-sensitive context here).
+uint64_t fnv1a64(const void * data, size_t bytes, uint64_t seed = 0xcbf29ce484222325ULL) {
+    const unsigned char * p = static_cast<const unsigned char *>(data);
+    uint64_t h = seed;
+    for (size_t i = 0; i < bytes; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+std::string bert_cache_key_for_input(
+    const std::string & path,
+    const std::vector<int64_t> & input_ids,
+    const std::vector<int64_t> & word2ph,
+    int64_t phone_count,
+    bool use_token_type_ids) {
+    uint64_t h = fnv1a64(path.data(), path.size());
+    h = fnv1a64(input_ids.data(), input_ids.size() * sizeof(int64_t), h);
+    h = fnv1a64(word2ph.data(), word2ph.size() * sizeof(int64_t), h);
+    h = fnv1a64(&phone_count, sizeof(phone_count), h);
+    const uint8_t flag = use_token_type_ids ? 1 : 0;
+    h = fnv1a64(&flag, sizeof(flag), h);
+    std::ostringstream ss;
+    ss << std::hex << h << '|' << input_ids.size() << '|' << phone_count;
+    return ss.str();
+}
+
+// Bounded LRU-ish cache: keep the last N distinct BERT inputs. Set
+// BV2_BERT_CACHE=0 to disable, BV2_BERT_CACHE_SIZE=N to resize (default 64).
+size_t bert_cache_capacity() {
+    static const int cap = env_int("BV2_BERT_CACHE_SIZE", 64);
+    return cap < 0 ? 0 : static_cast<size_t>(cap);
+}
+
+bool bert_cache_enabled() {
+    static const bool enabled = env_int("BV2_BERT_CACHE", 1) != 0;
+    return enabled && bert_cache_capacity() > 0;
+}
+
+struct BertCache {
+    std::mutex m;
+    std::map<std::string, Tensor> store;
+    std::vector<std::string> order;
+};
+
+BertCache & bert_cache() {
+    static BertCache cache;
+    return cache;
+}
+
+bool bert_cache_lookup(const std::string & key, Tensor & out) {
+    if (!bert_cache_enabled()) return false;
+    auto & c = bert_cache();
+    std::lock_guard<std::mutex> lock(c.m);
+    const auto it = c.store.find(key);
+    if (it == c.store.end()) return false;
+    out = it->second;
+    return true;
+}
+
+void bert_cache_store(const std::string & key, const Tensor & value) {
+    if (!bert_cache_enabled()) return;
+    auto & c = bert_cache();
+    std::lock_guard<std::mutex> lock(c.m);
+    auto [it, inserted] = c.store.emplace(key, value);
+    if (inserted) {
+        c.order.push_back(key);
+        while (c.order.size() > bert_cache_capacity()) {
+            c.store.erase(c.order.front());
+            c.order.erase(c.order.begin());
+        }
+    } else {
+        it->second = value;
+    }
+}
+
 Tensor bert_feature_from_input_ids(
     const std::string & bert_onnx_path,
     const std::vector<int64_t> & input_ids,
@@ -1508,15 +1993,38 @@ Tensor bert_feature_from_input_ids(
     int64_t phone_count,
     const SynthesisOptions & options,
     bool use_token_type_ids) {
-#ifndef BV2_WITH_ONNXRUNTIME
-    (void)bert_onnx_path; (void)input_ids; (void)word2ph; (void)phone_count; (void)options; (void)use_token_type_ids;
-    throw std::runtime_error("this binary was built without ONNX Runtime support");
-#else
     if (word2ph.empty()) return zeros_bert(phone_count);
     if (static_cast<int64_t>(word2ph.size()) != static_cast<int64_t>(input_ids.size())) {
         throw std::runtime_error("BERT word2ph length does not match token count");
     }
 
+    // Cache lookup — keyed on the exact (model, tokens, alignment) tuple, so
+    // identical text (or the same chunk reused across streaming calls) skips
+    // BERT inference entirely. ~600 KB / entry for typical text lengths.
+    const std::string cache_key = bert_cache_key_for_input(
+        bert_onnx_path, input_ids, word2ph, phone_count, use_token_type_ids);
+    {
+        Tensor cached;
+        if (bert_cache_lookup(cache_key, cached)) return cached;
+    }
+
+#ifdef BV2_WITH_MLX
+    if (options.use_mlx) {
+        std::vector<int64_t> tt;
+        if (use_token_type_ids) tt.assign(input_ids.size(), 0);
+        Tensor phone_bert = mlx_bert_feature(
+            bert_onnx_path, input_ids, tt, word2ph, phone_count, options);
+        bert_cache_store(cache_key, phone_bert);
+        return phone_bert;
+    }
+#endif
+
+#ifndef BV2_WITH_ONNXRUNTIME
+    (void)options; (void)use_token_type_ids;
+    throw std::runtime_error(
+        "this binary was built without ONNX Runtime support and "
+        "options.use_mlx is false");
+#else
     const int64_t tokens = static_cast<int64_t>(input_ids.size());
     std::vector<int64_t> ids = input_ids;
     std::vector<int64_t> attention_mask(static_cast<size_t>(tokens), 1);
@@ -1558,6 +2066,7 @@ Tensor bert_feature_from_input_ids(
     if (out_t != phone_bert.shape[0]) {
         throw std::runtime_error("BERT repeat length does not match phone length");
     }
+    bert_cache_store(cache_key, phone_bert);
     return phone_bert;
 #endif
 }
@@ -1568,9 +2077,10 @@ Tensor vocab_bert(
     const TextFeatures & text,
     const SynthesisOptions & options,
     bool use_token_type_ids) {
-#ifndef BV2_WITH_ONNXRUNTIME
+#if !defined(BV2_WITH_ONNXRUNTIME) && !defined(BV2_WITH_MLX)
     (void)bert_onnx_path; (void)vocab_path; (void)text; (void)options; (void)use_token_type_ids;
-    throw std::runtime_error("this binary was built without ONNX Runtime support");
+    throw std::runtime_error(
+        "this binary was built without ONNX Runtime or MLX BERT support");
 #else
     if (text.word2ph.empty() || text.bert_tokens.empty()) {
         return zeros_bert(static_cast<int64_t>(text.phones.size()));
@@ -1638,9 +2148,10 @@ Tensor english_bert(
     const std::string & norm_text,
     const TextFeatures & text,
     const SynthesisOptions & options) {
-#ifndef BV2_WITH_ONNXRUNTIME
+#if !defined(BV2_WITH_ONNXRUNTIME) && !defined(BV2_WITH_MLX)
     (void)bert_onnx_path; (void)spm_model_path; (void)norm_text; (void)text; (void)options;
-    throw std::runtime_error("this binary was built without ONNX Runtime support");
+    throw std::runtime_error(
+        "this binary was built without ONNX Runtime or MLX BERT support");
 #else
     if (text.word2ph.empty()) {
         return zeros_bert(static_cast<int64_t>(text.phones.size()));
@@ -1705,6 +2216,30 @@ Tensor load_float_bin(const std::string & path, std::vector<int64_t> shape) {
 void preload_synthesis_model(
     const ModelPaths & paths,
     const SynthesisOptions & options) {
+#ifdef BV2_WITH_MLX
+    if (options.use_mlx) {
+        auto rt = cached_mlx_runtime(paths, options);
+        // Run a small dummy inference to pre-compile Metal shaders for a
+        // representative phone-sequence length.  The first real request then
+        // only pays the incremental cost of a different shape, not a full cold
+        // compilation.
+        if (rt && rt->is_loaded()) {
+            constexpr int kWarmupPhones = 20;
+            bv2::mlx_rt::MlxInferInputs dummy;
+            dummy.phones.assign(kWarmupPhones, 110);    // "SP" silence token
+            dummy.tones.assign(kWarmupPhones, 0);
+            dummy.languages.assign(kWarmupPhones, 0);   // ZH
+            dummy.bert_zh.assign(static_cast<size_t>(kWarmupPhones) * 1024, 0.0f);
+            dummy.bert_jp.assign(static_cast<size_t>(kWarmupPhones) * 1024, 0.0f);
+            dummy.bert_en.assign(static_cast<size_t>(kWarmupPhones) * 1024, 0.0f);
+            dummy.speaker_id = 0;
+            std::string warmup_err;
+            std::fprintf(stdout, "  (MLX shader warm-up...)\n");
+            rt->infer(dummy, &warmup_err);
+        }
+        return;
+    }
+#endif
 #ifndef BV2_WITH_ONNXRUNTIME
     (void)paths; (void)options;
     throw std::runtime_error("this binary was built without ONNX Runtime support");
@@ -1716,6 +2251,53 @@ void preload_synthesis_model(
 void preload_bert_models(
     const BertPaths & paths,
     const SynthesisOptions & options) {
+#ifdef BV2_WITH_MLX
+    // MLX backend uses its own safetensors-based BERT runtime; skip the
+    // ONNX session warm-up entirely (loading those would just waste ~3-4 GB
+    // of RAM that the actual inference path never touches). We do still
+    // pre-warm the MLX BertRuntime cache for each configured language so
+    // the FIRST HTTP request doesn't pay the ~600 ms cold-load cost.
+    if (options.use_mlx) {
+        auto try_preload = [&](const std::string & onnx_path,
+                               const char * label) {
+            if (onnx_path.empty()) return;
+            try {
+                auto bert_rt = cached_mlx_bert(onnx_path, options);
+                // Warm up Metal shaders with a small dummy BERT forward pass.
+                if (bert_rt && bert_rt->is_loaded()) {
+                    constexpr int kN = 10;
+                    bv2::mlx_rt::BertInferInputs dummy;
+                    dummy.input_ids.assign(kN, 100);   // arbitrary valid token id
+                    dummy.token_type_ids.assign(kN, 0);
+                    dummy.word2ph.assign(kN, 1);       // 1 phone per token
+                    dummy.phone_count = kN;
+                    std::string warmup_err;
+                    bert_rt->infer(dummy, &warmup_err);
+                    std::fprintf(stdout, "  (MLX BERT %s shader warm-up done)\n", label);
+                }
+            } catch (const std::exception & e) {
+                std::fprintf(stderr,
+                             "  [warn] MLX %s preload skipped: %s\n",
+                             label, e.what());
+            }
+        };
+        try_preload(paths.zh_model, "ZH");
+        try_preload(paths.jp_model, "JP");
+        try_preload(paths.en_model, "EN");
+        // Tokenisers are still ONNX-vocab files; load them so the first
+        // request doesn't block on disk I/O.
+        if (!paths.zh_vocab.empty()) {
+            try { (void)load_vocab_map(paths.zh_vocab); } catch (...) {}
+        }
+        if (!paths.jp_vocab.empty()) {
+            try { (void)load_vocab_map(paths.jp_vocab); } catch (...) {}
+        }
+        if (!paths.en_spm.empty()) {
+            try { (void)cached_sentencepiece(paths.en_spm); } catch (...) {}
+        }
+        return;
+    }
+#endif
 #ifndef BV2_WITH_ONNXRUNTIME
     (void)paths; (void)options;
     throw std::runtime_error("this binary was built without ONNX Runtime support");
@@ -1785,13 +2367,19 @@ std::vector<float> synthesize(
     const Tensor * bert_jp,
     const Tensor * bert_en,
     const Tensor * emotion) {
-#ifndef BV2_WITH_ONNXRUNTIME
-    (void)paths; (void)text; (void)options; (void)bert_zh; (void)bert_jp; (void)bert_en; (void)emotion;
-    throw std::runtime_error("this binary was built without ONNX Runtime support");
-#else
     if (text.phones.size() != text.tones.size() || text.phones.size() != text.languages.size()) {
         throw std::runtime_error("text feature lengths do not match");
     }
+#ifdef BV2_WITH_MLX
+    if (options.use_mlx) {
+        (void)emotion;  // MLX path doesn't take an emotion vector (v2.3 has none).
+        return synthesize_with_mlx(paths, text, options, bert_zh, bert_jp, bert_en);
+    }
+#endif
+#ifndef BV2_WITH_ONNXRUNTIME
+    (void)paths; (void)options; (void)bert_zh; (void)bert_jp; (void)bert_en; (void)emotion;
+    throw std::runtime_error("this binary was built without ONNX Runtime support");
+#else
 
     const int64_t tx = static_cast<int64_t>(text.phones.size());
     auto ort = cached_ort_bundle(paths, options);

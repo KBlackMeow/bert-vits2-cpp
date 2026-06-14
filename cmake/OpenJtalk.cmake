@@ -7,6 +7,11 @@ if(NOT TARGET openjtalk)
         GIT_TAG 1.11
         GIT_SHALLOW TRUE
     )
+    # We need the source tree but also want to call add_subdirectory on the
+    # nested src/ folder with our own option overrides, so populate manually.
+    if(POLICY CMP0169)
+        cmake_policy(SET CMP0169 OLD)
+    endif()
     FetchContent_GetProperties(openjtalk)
     if(NOT openjtalk_POPULATED)
         FetchContent_Populate(openjtalk)
