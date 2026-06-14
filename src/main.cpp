@@ -882,6 +882,81 @@ BertBundle build_mixed_bert(const Args & args, const bv2::MixedSequence & mixed)
     return out;
 }
 
+// Map foreign-language tone values and language ids into the speaker's
+// native range.  A speaker trained primarily on one language has meaningful
+// tone embeddings only in its own tone range and may only have a language
+// embedding for its own language id.  Without this remap, foreign phones
+// produce near-zero embeddings → silent output.
+//
+// Tone ranges per language (see tone_start in bv2_tts.cpp):
+//   ZH  [0,5]   6 values: 0=neutral 1=high 2=rising 3=low 4=falling 5=neutral
+//   JP  [6,7]   2 values: 6=non-accent(low)  7=accent-kernel(high)
+//   EN  [8,9]   2 values: 8=unstressed       9=stressed
+//
+// Language ids (see language_id in bv2_tts.cpp):
+//   0=ZH  1=JP  2=EN
+static void remap_tones_to_speaker(
+    std::vector<int64_t> & tones,
+    std::vector<int64_t> & languages,
+    const std::string & speaker_lang)
+{
+    const int64_t native_lang_id = (speaker_lang == "JP") ? 1 : (speaker_lang == "EN") ? 2 : 0;
+
+    if (speaker_lang == "ZH") {
+        for (size_t i = 0; i < tones.size(); ++i) {
+            const int64_t t = tones[i];
+            if (languages[i] == 1) {          // JP → ZH
+                tones[i] = (t == 7) ? 1 : 3;   // accent-high→ZH1, non-accent→ZH3
+                languages[i] = 0;
+            } else if (languages[i] == 2) {    // EN → ZH
+                tones[i] = (t == 9) ? 4 : 0;   // stressed→ZH4(falling), unstressed→ZH0
+                languages[i] = 0;
+            }
+        }
+    } else if (speaker_lang == "JP") {
+        for (size_t i = 0; i < tones.size(); ++i) {
+            const int64_t t = tones[i];
+            if (languages[i] == 0) {          // ZH → JP
+                tones[i] = (t == 0 || t == 5) ? 6 : 7;
+                languages[i] = 1;
+            } else if (languages[i] == 2) {    // EN → JP
+                tones[i] = (t == 9) ? 7 : 6;
+                languages[i] = 1;
+            }
+        }
+    } else if (speaker_lang == "EN") {
+        for (size_t i = 0; i < tones.size(); ++i) {
+            const int64_t t = tones[i];
+            if (languages[i] == 0) {          // ZH → EN
+                tones[i] = (t == 0 || t == 5) ? 8 : 9;
+                languages[i] = 2;
+            } else if (languages[i] == 1) {    // JP → EN
+                tones[i] = (t == 7) ? 9 : 8;
+                languages[i] = 2;
+            }
+        }
+    }
+    // Also zero out any remaining foreign language ids for phones that
+    // happen to already have native-range tones (e.g. tone=0 from a
+    // fallback path).
+    for (size_t i = 0; i < languages.size(); ++i) {
+        if (languages[i] != native_lang_id) languages[i] = native_lang_id;
+    }
+}
+
+// Determine the speaker's native language from its id.
+static std::string speaker_native_lang(const Args & args) {
+    const auto speakers = speaker_map_for(args);
+    for (const auto & [name, id] : speakers) {
+        if (id != args.options.speaker_id) continue;
+        if (name.size() >= 3 && name.substr(name.size() - 3) == "_zh") return "ZH";
+        if (name.size() >= 3 && name.substr(name.size() - 3) == "_ja") return "JP";
+        if (name.size() >= 3 && name.substr(name.size() - 3) == "_en") return "EN";
+        break;
+    }
+    return "ZH";
+}
+
 std::vector<float> synthesize_features(
     const Args & args,
     const bv2::TextFeatures & features,
@@ -889,9 +964,21 @@ std::vector<float> synthesize_features(
     const std::string & language_override = "") {
     const std::string language = language_override.empty() ? args.language : language_override;
     const std::string norm_text = features.norm_text.empty() ? text_for_bert : features.norm_text;
-    const BertBundle bert = build_single_language_bert(args, features, norm_text, language);
+
+    // When the text language differs from the speaker's native language
+    // (e.g. JP text → keqing_zh), remap foreign tone values into the
+    // speaker's tone range so every (phone, tone) pair hits a trained
+    // embedding.  Without this, JP tones [6,7] or EN tones [8,9] map to
+    // near-zero embeddings for a ZH speaker → silent phones.
+    bv2::TextFeatures toned = features;
+    const std::string spk_lang = speaker_native_lang(args);
+    if (spk_lang != language) {
+        remap_tones_to_speaker(toned.tones, toned.languages, spk_lang);
+    }
+
+    const BertBundle bert = build_single_language_bert(args, toned, norm_text, language);
     return bv2::synthesize(
-        args.paths, features, args.options, &bert.zh, &bert.jp, &bert.en, &bert.emo);
+        args.paths, toned, args.options, &bert.zh, &bert.jp, &bert.en, &bert.emo);
 }
 
 std::vector<float> synthesize_single_language_text(const Args & args) {
@@ -901,10 +988,13 @@ std::vector<float> synthesize_single_language_text(const Args & args) {
 
 std::vector<float> synthesize_mixed_spans(const Args & args) {
     const std::string primary = first_char_language(args.text);
-    const bv2::MixedSequence mixed = bv2::prepare_mixed_sequence(args.text, primary);
+    bv2::MixedSequence mixed = bv2::prepare_mixed_sequence(args.text, primary);
     if (mixed.spans.empty()) {
+        // Reaches here only if every span was trimmed to zero phones (very
+        // rare edge case).  Use the detected primary language rather than the
+        // hardcoded "ZH" that was here before; ZH would strip kana/Latin.
         Args fallback = args;
-        fallback.language = "ZH";
+        fallback.language = primary.empty() ? "ZH" : primary;
         return synthesize_single_language_text(fallback);
     }
     if (mixed.spans.size() == 1) {
@@ -914,12 +1004,21 @@ std::vector<float> synthesize_mixed_spans(const Args & args) {
         return synthesize_single_language_text(single);
     }
 
-    std::cout << "mix single-pass spans=" << mixed.spans.size()
-              << " speaker_id=" << args.options.speaker_id << "\n";
-    for (size_t i = 0; i < mixed.spans.size(); ++i) {
-        std::cout << "  span " << mixed.spans[i].lang
-                  << " chars=" << mixed.spans[i].text.size()
-                  << " phones=" << mixed.spans[i].phone_count << "\n";
+    // Multi-span mixed-language synthesis.
+    // Each span was processed by its own G2P frontend (ZH→pinyin,
+    // JP→OpenJTalk, EN→CMUdict) and BERT model → best possible prosody.
+    // The tone values, however, live in per-language ranges
+    // (ZH [0,5], JP [6,7], EN [8,9]).  A speaker trained primarily on
+    // one language has meaningful tone embeddings only in its own range;
+    // foreign tone values map to near-zero embeddings → silent phones.
+    //
+    // Fix: remap foreign tones into the speaker's native range before
+    // VITS inference, preserving relative pitch (high↔prominent,
+    // low↔neutral).  The phone sequence and BERT features are untouched
+    // — only the tone channel is adjusted for cross-lingual compatibility.
+    {
+        remap_tones_to_speaker(
+            mixed.features.tones, mixed.features.languages, speaker_native_lang(args));
     }
 
     const BertBundle bert = build_mixed_bert(args, mixed);
@@ -929,7 +1028,32 @@ std::vector<float> synthesize_mixed_spans(const Args & args) {
 
 std::vector<float> synthesize_text_chunks(const Args & args) {
     if (args.language == "MIX") {
-        return synthesize_mixed_spans(args);
+        const std::vector<std::string> chunks = args.split_text
+            ? split_text_chunks(args.text, args.max_chunk_chars)
+            : std::vector<std::string>{args.text};
+        if (chunks.size() > 1) {
+            std::cout << "split text into " << chunks.size() << " chunks\n";
+        }
+        std::vector<float> audio;
+        const size_t pause_samples = static_cast<size_t>(
+            static_cast<int64_t>(args.options.sample_rate) * args.chunk_pause_ms / 1000);
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            Args chunk_args = args;
+            chunk_args.text = chunks[i];
+            chunk_args.language = detect_language(chunks[i]);
+            std::vector<float> chunk_audio;
+            if (chunk_args.language == "MIX") {
+                chunk_audio = synthesize_mixed_spans(chunk_args);
+            } else {
+                const bv2::TextFeatures features = bv2::text_to_sequence(chunks[i], chunk_args.language);
+                chunk_audio = synthesize_features(chunk_args, features, chunks[i]);
+            }
+            audio.insert(audio.end(), chunk_audio.begin(), chunk_audio.end());
+            if (i + 1 < chunks.size() && pause_samples > 0) {
+                audio.insert(audio.end(), pause_samples, 0.0f);
+            }
+        }
+        return audio;
     }
 
     const std::vector<std::string> chunks = args.split_text
@@ -1245,6 +1369,11 @@ Args args_from_http_tts(const Args & base, const std::string & body, const std::
     if (!args.speaker_set) {
         args.options.speaker_id = default_speaker_id_for_language(args.language, speakers);
     }
+
+    // No language coercion — keep MIX so per-language G2P + BERT quality
+    // is preserved.  Tone-value cross-lingual remapping happens later in
+    // synthesize_mixed_spans (see remap_tones_to_speaker).
+
     return args;
 }
 

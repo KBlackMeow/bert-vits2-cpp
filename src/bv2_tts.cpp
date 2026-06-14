@@ -291,6 +291,9 @@ std::vector<float> synthesize_with_mlx(
 
 } // namespace
 
+// Forward declaration — defined after english_word_phones.
+std::string spell_ascii_for_language(const std::string & text, const std::string & lang);
+
 namespace internal {
 
 const std::map<std::string, int64_t> & symbol_ids() {
@@ -787,7 +790,7 @@ std::string normalize_english_numbers(const std::string & text) {
 }
 
 TextFeatures zh_text_to_sequence(const std::string & text) {
-    return zh::text_to_sequence(text);
+    return zh::text_to_sequence(spell_ascii_for_language(text, "ZH"));
 }
 
 std::vector<int64_t> distribute_phone(int64_t n_phone, int64_t n_word) {
@@ -1025,10 +1028,11 @@ TextFeatures jp_text_to_sequence_fallback(const std::string & text) {
 } // namespace
 
 TextFeatures jp_text_to_sequence(const std::string & text) {
+    const std::string spelled = spell_ascii_for_language(text, "JP");
     if (openjtalk_available()) {
-        return jp_text_to_sequence_openjtalk(text);
+        return jp_text_to_sequence_openjtalk(spelled);
     }
-    return jp_text_to_sequence_fallback(text);
+    return jp_text_to_sequence_fallback(spelled);
 }
 
 namespace {
@@ -1121,6 +1125,139 @@ std::vector<std::string> rough_english_word_to_phones(const std::string & word) 
     }
     return phones;
 }
+
+} // namespace
+
+// ============================================================
+//  ASCII → phonetic spelling for ZH / JP frontends
+// ============================================================
+
+// ARPAbet / unified phone symbol → closest-sounding Chinese character.
+static const char * phone_to_zh_char(const std::string & ph) {
+    static const std::map<std::string, const char *> m = {
+        {"aa","阿"},{"ae","艾"},{"ah","阿"},{"ao","奥"},{"aw","奥"},{"ay","艾"},
+        {"e","厄"},{"eh","艾"},{"er","尔"},{"ey","诶"},{"i","伊"},{"ih","伊"},
+        {"iy","伊"},{"o","欧"},{"ow","欧"},{"oy","奥伊"},{"u","乌"},{"uh","乌"},
+        {"uw","乌"},{"V","阿"},
+        {"b","布"},{"ch","奇"},{"d","德"},{"dh","兹"},{"f","弗"},{"g","格"},
+        {"hh","赫"},{"jh","吉"},{"k","克"},{"l","勒"},{"m","姆"},{"n","恩"},
+        {"ng","恩"},{"p","普"},{"r","尔"},{"s","斯"},{"sh","什"},{"t","特"},
+        {"th","斯"},{"v","弗"},{"w","乌"},{"y","伊"},{"z","兹"},{"zh","日"},
+    };
+    auto it = m.find(ph);
+    return it != m.end() ? it->second : nullptr;
+}
+
+// ARPAbet / unified phone symbol → closest katakana.
+static const char * phone_to_jp_kana(const std::string & ph) {
+    static const std::map<std::string, const char *> m = {
+        {"aa","アー"},{"ae","エア"},{"ah","ア"},{"ao","オー"},{"aw","アウ"},{"ay","アイ"},
+        {"e","エ"},{"eh","エ"},{"er","アー"},{"ey","エイ"},{"i","イ"},{"ih","イ"},
+        {"iy","イー"},{"o","オ"},{"ow","オウ"},{"oy","オイ"},{"u","ウ"},{"uh","ウ"},
+        {"uw","ウー"},{"V","ア"},
+        {"b","ブ"},{"ch","チ"},{"d","ド"},{"dh","ズ"},{"f","フ"},{"g","グ"},
+        {"hh","フ"},{"jh","ジ"},{"k","ク"},{"l","ル"},{"m","ム"},{"n","ン"},
+        {"ng","ング"},{"p","プ"},{"r","ル"},{"s","ス"},{"sh","シ"},{"t","ト"},
+        {"th","ス"},{"v","ヴ"},{"w","ウ"},{"y","イ"},{"z","ズ"},{"zh","ジ"},
+    };
+    auto it = m.find(ph);
+    return it != m.end() ? it->second : nullptr;
+}
+
+// Convert an ASCII word into a phonetic spelling using
+// CMUdict → ARPAbet → native-character mapping.
+static std::string spell_one_ascii_word(const std::string & word, const std::string & lang) {
+    // ---- 0) curated list for common tech terms ----
+    static const std::map<std::string, std::pair<const char *, const char *>> kKnown = {
+        {"Windows",   {"温斗士",    "ウィンドウズ"}},
+        {"Linux",     {"林纽克斯",  "リナックス"}},
+        {"macOS",     {"麦克欧艾斯","マックオーエス"}},
+        {"CPU",       {"处理器",    "シーピーユー"}},
+        {"GPU",       {"显卡",      "ジーピーユー"}},
+        {"HTTP",      {"艾尺提提皮","エイチティーティーピー"}},
+        {"HTTPS",     {"艾尺提提皮艾斯","エイチティーティーピーエス"}},
+        {"API",       {"接口",      "エーピーアイ"}},
+        {"PCM",       {"皮西艾姆",  "ピーシーエム"}},
+        {"WAV",       {"威艾威",    "ワブ"}},
+        {"curl",      {"科尔",      "カール"}},
+        {"GitHub",    {"给特哈波",  "ギットハブ"}},
+        {"BERT",      {"伯特",      "バート"}},
+        {"VITS2",     {"威茨二",    "ヴィッツツー"}},
+        {"VITS",      {"威茨",      "ヴィッツ"}},
+        {"ONNX",      {"欧恩恩",    "オーエヌエヌエックス"}},
+        {"MLX",       {"艾姆艾尔艾克斯","エムエルエックス"}},
+        {"Metal",     {"麦塔",      "メタル"}},
+        {"CUDA",      {"库达",      "クーダ"}},
+        {"PyTorch",   {"派托奇",    "パイトーチ"}},
+        {"RoBERTa",   {"罗伯塔",    "ロベルタ"}},
+        {"DeBERTa",   {"迪伯塔",    "デベルタ"}},
+        {"HiFi-GAN",  {"海菲甘",    "ハイファイガン"}},
+        {"C++",       {"C加加",     "シープラスプラス"}},
+        {"OK",        {"好的",      "オーケー"}},
+    };
+    {
+        auto it = kKnown.find(word);
+        if (it != kKnown.end()) return lang == "JP" ? it->second.second : it->second.first;
+        std::string upper = word;
+        for (char & c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        it = kKnown.find(upper);
+        if (it != kKnown.end()) return lang == "JP" ? it->second.second : it->second.first;
+    }
+
+    // ---- 1) CMUdict → ARPAbet → native characters ----
+    auto phones_tones = english_word_phones(word);
+    const auto & phones = phones_tones.first;
+    if (!phones.empty() && !(phones.size() == 1 && phones[0] == "UNK")) {
+        std::string out;
+        bool is_jp = (lang == "JP");
+        for (size_t i = 0; i < phones.size(); ++i) {
+            const char * s = is_jp ? phone_to_jp_kana(phones[i]) : phone_to_zh_char(phones[i]);
+            if (s) out.append(s);
+        }
+        if (!out.empty()) return out;
+    }
+
+    // ---- 2) letter-by-letter last resort ----
+    static const char * kZhLetters[26] = {
+        "诶","必","西","迪","伊","艾弗","吉","艾尺","艾","杰","开","艾勒","艾姆",
+        "恩","欧","皮","吉欧","阿尔","艾斯","提","优","威","达布留","艾克斯","外","贼",
+    };
+    static const char * kJpLetters[26] = {
+        "エー","ビー","シー","ディー","イー","エフ","ジー","エイチ","アイ",
+        "ジェー","ケー","エル","エム","エヌ","オー","ピー","キュー","アール",
+        "エス","ティー","ユー","ブイ","ダブリュー","エックス","ワイ","ゼット",
+    };
+    static const char * kZhNums[10] = {"零","一","二","三","四","五","六","七","八","九"};
+    static const char * kJpNums[10] = {"ゼロ","イチ","ニ","サン","ヨン","ゴ","ロク","ナナ","ハチ","キュウ"};
+    std::string out;
+    for (char c : word) {
+        if (c >= 'A' && c <= 'Z') out.append(lang == "JP" ? kJpLetters[c - 'A'] : kZhLetters[c - 'A']);
+        else if (c >= 'a' && c <= 'z') out.append(lang == "JP" ? kJpLetters[c - 'a'] : kZhLetters[c - 'a']);
+        else if (c >= '0' && c <= '9') out.append(lang == "JP" ? kJpNums[c - '0'] : kZhNums[c - '0']);
+        else out.push_back(c);
+    }
+    return out;
+}
+
+// Scan text for ASCII words and replace each with its phonetic spelling.
+std::string spell_ascii_for_language(const std::string & text, const std::string & lang) {
+    std::string out;
+    out.reserve(text.size() * 3);
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t start = i;
+        while (i < text.size()) {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+            if (std::isalnum(c) || c == '+' || c == '-' || c == '_' || c == '.') { ++i; }
+            else break;
+        }
+        if (i == start) { out.push_back(text[i++]); continue; }
+        out.append(spell_one_ascii_word(text.substr(start, i - start), lang));
+    }
+    return out;
+}
+
+namespace {
 
 Tensor sequence_mask(const std::vector<int64_t> & lengths, int64_t max_length) {
     Tensor mask({static_cast<int64_t>(lengths.size()), 1, max_length});
@@ -1294,6 +1431,16 @@ void configure_execution_provider(
     if (options.use_cuda) {
         OrtCUDAProviderOptions cuda_options{};
         cuda_options.device_id = options.cuda_device_id;
+        // NOTE: gpu_mem_limit defaults to SIZE_MAX (no per-session cap).
+        // With 9 concurrent ONNX sessions (3 BERT-large + 6 VITS sub-models)
+        // the BFC arenas can together consume ~15–20 GiB on a 24 GiB card.
+        // arena_extend_strategy defaults to kNextPowerOfTwo which wastes up
+        // to ~50 % per arena but reduces fragmentation for repeated allocs.
+        // If VRAM pressure is a problem, cap the heaviest sessions:
+        //   role==kBert    → gpu_mem_limit = 2 GiB
+        //   role==kVitsDec → gpu_mem_limit = 2 GiB  (ConvTranspose)
+        //   role==kVitsFlow→ gpu_mem_limit = 2 GiB  (self-attn MatMul)
+        //   others         → gpu_mem_limit = 256 MiB
         opts.AppendExecutionProvider_CUDA(cuda_options);
         return;
     }
@@ -1562,7 +1709,8 @@ int count_substr_hits(const std::string & text, const std::vector<const char *> 
     return score;
 }
 
-std::string classify_zh_ja_grammar(const std::string & text, const std::string & fallback) {
+std::string classify_zh_ja_grammar(const std::string & text, const std::string & fallback,
+                                        const std::string & context_lang = "") {
     static const std::vector<const char *> jp_markers = {
         "です", "ます", "でした", "ません", "である", "から", "まで", "見込み", "見込",
         "気温", "天気", "快晴", "曇", "東京", "今日", "明日", "昨日", "パーセント",
@@ -1581,6 +1729,15 @@ std::string classify_zh_ja_grammar(const std::string & text, const std::string &
     static const std::vector<const char *> jp_chars = {
         "の", "を", "が", "は", "も", "へ", "と", "や", "ね", "よ", "ば", "か",
     };
+    // Japanese-specific shinjitai kanji that differ from Chinese simplified forms.
+    // Seeing any of these in a CJK-only segment is a strong JP signal.
+    // NOTE: 担 (U+62C5) and 欠 (U+6B20) were removed because they are also
+    // common Chinese characters (担任/担心, 欠缺/欠债) and would cause false
+    // jp_score boosts for Chinese text.
+    static const std::vector<const char *> jp_only_kanji = {
+        "効", "円", "売", "伝", "仏", "毎", "桜", "戦", "拝",
+        "徳", "壊", "釈", "弁", "舗", "賃", "芸", "抜",
+    };
 
     int jp_score = count_substr_hits(text, jp_markers, 3);
     int zh_score = count_substr_hits(text, zh_markers, 3);
@@ -1595,18 +1752,28 @@ std::string classify_zh_ja_grammar(const std::string & text, const std::string &
     for (const std::string & ch : internal::utf8_chars(text)) {
         if (internal::is_kana_char(ch)) jp_score += 3;
     }
+    jp_score += count_substr_hits(text, jp_only_kanji, 3);
+    // Only use context as a tiebreaker when there is at least some non-zero
+    // linguistic evidence for both languages.  When both scores are 0 (the
+    // sentence has no recognisable markers at all – e.g. "第三，网络服务。"),
+    // blindly inheriting the previous language (JP) would misclassify short
+    // Chinese topic headings that appear after a Japanese paragraph.
+    if (jp_score > 0 && jp_score == zh_score && !context_lang.empty() && (context_lang == "JP" || context_lang == "ZH")) {
+        return context_lang;
+    }
     if (jp_score == zh_score) return fallback;
     return jp_score > zh_score ? "JP" : "ZH";
 }
 
-std::string classify_sentence_language_impl(const std::string & sentence, const std::string & fallback) {
+std::string classify_sentence_language_impl(const std::string & sentence, const std::string & fallback,
+                                              const std::string & context_lang = "") {
     const std::string trimmed = trim_span_copy(sentence);
     if (trimmed.empty()) return fallback;
 
     if (text_has_kana(trimmed)) return "JP";
     if (text_has_latin_letters(trimmed) && !text_has_cjk(trimmed)) return "EN";
     if (text_has_cjk(trimmed) && !text_has_latin_letters(trimmed)) {
-        return classify_zh_ja_grammar(trimmed, fallback);
+        return classify_zh_ja_grammar(trimmed, fallback, context_lang);
     }
     return fallback;
 }
@@ -1697,7 +1864,8 @@ std::vector<std::pair<std::string, std::string>> split_script_blocks(
 
 std::vector<std::pair<std::string, std::string>> classify_and_split_sentence(
     const std::string & sentence,
-    const std::string & fallback) {
+    const std::string & fallback,
+    const std::string & context_lang = "") {
     const std::string trimmed = trim_span_copy(sentence);
     if (trimmed.empty()) return {};
 
@@ -1705,7 +1873,7 @@ std::vector<std::pair<std::string, std::string>> classify_and_split_sentence(
     if (text_has_latin_letters(trimmed) && text_has_cjk(trimmed)) {
         return split_script_blocks(sentence, fallback);
     }
-    return {{sentence, classify_sentence_language_impl(sentence, fallback)}};
+    return {{sentence, classify_sentence_language_impl(sentence, fallback, context_lang)}};
 }
 
 } // namespace
@@ -1720,11 +1888,13 @@ std::vector<std::pair<std::string, std::string>> split_text_by_language(
     if (trim_span_copy(text).empty()) return spans;
 
     const std::string fallback = primary_lang.empty() ? "ZH" : primary_lang;
+    std::string prev_lang;
     for (const std::string & sentence : split_sentences(text)) {
-        const auto parts = classify_and_split_sentence(sentence, fallback);
+        const auto parts = classify_and_split_sentence(sentence, fallback, prev_lang);
         for (const auto & [segment, lang] : parts) {
             const std::string trimmed = trim_span_copy(segment);
             if (trimmed.empty()) continue;
+            prev_lang = lang;
             if (!spans.empty() && spans.back().second == lang) {
                 spans.back().first += trimmed;
             } else {
@@ -1776,6 +1946,18 @@ MixedSequence prepare_mixed_sequence(const std::string & text, const std::string
     }
     if (spans.size() == 1) {
         out.features = text_to_sequence(text, spans[0].second);
+        // Populate out.spans so synthesize_mixed_spans can read the detected
+        // language back.  Without this, the caller sees spans.empty() and
+        // incorrectly falls through to the hardcoded "ZH" fallback, causing
+        // Japanese kana to be stripped by the Chinese frontend.
+        MixedSpanInfo info;
+        info.text = text;
+        info.lang = spans[0].second;
+        info.full_features = out.features;
+        info.phone_offset = 0;
+        info.phone_begin_in_full = 0;
+        info.phone_count = static_cast<int64_t>(out.features.phones.size());
+        out.spans.push_back(std::move(info));
         return out;
     }
 
