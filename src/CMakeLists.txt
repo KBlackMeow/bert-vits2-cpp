@@ -10,6 +10,30 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 
+# Performance tuning for the host CPU.  -mcpu=native lets Clang/GCC emit
+# micro-architecture specific NEON/AMX instructions (M1/M2/M3 on Apple Silicon,
+# AVX2/AVX-512 on x86_64).  LTO (Link-Time Optimisation) inlines across
+# translation units and strips dead code; thin LTO keeps link-time reasonable.
+# Both apply to all FetchContent dependencies (MLX, sentencepiece, openjtalk)
+# because we set CMAKE_CXX_FLAGS_RELEASE before include()-ing them.
+if(NOT BV2_CPU_FLAGS_APPLIED)
+    set(BV2_CPU_FLAGS_APPLIED ON CACHE INTERNAL "Guard against flag duplication")
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mcpu=apple-m1")
+        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -mcpu=apple-m1")
+    else()
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mcpu=native")
+        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -mcpu=native")
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto=thin")
+        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -flto=thin")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
+        set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -flto")
+    endif()
+endif()
+
 option(BERT_VITS2_WITH_ONNXRUNTIME "Build ONNX Runtime based Bert-VITS2 inference" ON)
 
 # Apple Silicon native MLX backend (only built on macOS arm64).

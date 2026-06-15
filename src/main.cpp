@@ -89,7 +89,7 @@ struct Args {
     std::string host = "127.0.0.1";
     int port = 7860;
     bool device_set = false;
-    bool warmup = true;
+
 };
 
 std::map<std::string, int64_t> default_speaker_map() {
@@ -134,7 +134,7 @@ void usage(const char * exe) {
         << "  --en-bert-spm FILE     English BERT SentencePiece model path\n"
         << "  --no-bert              disable automatic BERT for --text\n"
         << "  --no-split             disable automatic sentence chunking for --text\n"
-        << "  --no-warmup            skip server warm-up synthesis (faster startup, slow first request)\n"
+
         << "  --dump-spans           print language spans for MIX text and exit\n"
         << "  --max-chunk-chars N    max characters per text chunk, default 240\n"
         << "  --chunk-pause-ms N     silence between chunks, default 120\n"
@@ -600,7 +600,7 @@ Args parse_args(const std::vector<std::string> & argv) {
         else if (key == "--no-bert") args.auto_bert = false;
         else if (key == "--dump-spans") args.dump_spans = true;
         else if (key == "--no-split") args.split_text = false;
-        else if (key == "--no-warmup") args.warmup = false;
+
         else if (key == "--max-chunk-chars") args.max_chunk_chars = static_cast<size_t>(std::stoul(next(key)));
         else if (key == "--chunk-pause-ms") args.chunk_pause_ms = std::stoi(next(key));
         else if (key == "--device") {
@@ -1678,67 +1678,7 @@ int run_http_server(const Args & args) {
     }
     std::cout << "preload complete\n";
 
-    // Warm-up synthesis. Three things contribute to the cold first-request cost
-    // on Apple Silicon, only the first of which is what people usually mean by
-    // "JIT cache":
-    //   1. process-local MLX Metal pipeline cache (cleared on restart)
-    //   2. system-wide Apple Metal compiled-shader disk cache under
-    //      ~/Library/Caches/com.apple.metal/, populated by the OS the first
-    //      time any process compiles a given shader (persists, but is not
-    //      under our control)
-    //   3. CPU/GPU DVFS - after several seconds of idle the SoC drops to a low
-    //      P-state and needs ~10-20s of sustained load to return to peak. A
-    //      tiny warm-up payload doesn't push it up.
-    //
-    // To address all three we run synthesis on a payload whose chunk size
-    // matches `max_chunk_chars` (default 240 ZH chars). That hits the same
-    // VITS / BERT shapes the user's real requests will use and keeps the GPU
-    // busy long enough to spin DVFS up.
-    if (args.warmup && args.server) {
-        std::cout << "warming up synthesis pipelines...\n";
-        const auto warmup_t0 = std::chrono::steady_clock::now();
-        // A long ZH paragraph (~220 chars) covers the typical chunk size; the
-        // shorter ones cover edge cases (short queries, single-sentence calls).
-        const std::string long_zh =
-            "晚饭后我沿着河边一直走，看天色慢慢由蓝转紫，再由紫转灰。"
-            "桥上的灯一盏一盏亮起来，水面被切成很多细碎的金色。"
-            "有人在岸边吹笛，调子很慢，像在讲一个许久未提起的故事。"
-            "我停下来听了一会儿，又继续往前走。城市并不安静，但此刻却觉得心里很平。"
-            "也许长大后能记得的，并不是某一天发生的大事，"
-            "而是这样一个普通的夜晚，风很轻，路很长，不必着急去任何地方。";
-        const std::vector<std::pair<std::string, std::string>> warmup_jobs = {
-            {"ZH", "你好，这是一次测试"},
-            {"ZH", "今天天气不错，适合出门散步，听听风声和鸟叫，挺好的。"},
-            {"ZH", long_zh},
-        };
-        for (const auto & [lang, text] : warmup_jobs) {
-            Args wa = args;
-            wa.text = text;
-            wa.language = lang;
-            wa.split_text = false;
-            wa.auto_bert = true;
-            wa.out.clear();
-            wa.options.speaker_id = 0;
-            wa.speaker_set = true;
-            const auto job_t0 = std::chrono::steady_clock::now();
-            try {
-                SynthesisGate::Guard gate(g_synthesis_gate);
-                (void)synthesize_args(wa);
-            } catch (const std::exception & e) {
-                std::fprintf(stderr,
-                             "  [warmup] %zu chars skipped: %s\n",
-                             text.size(), e.what());
-                continue;
-            }
-            const auto job_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - job_t0).count();
-            std::cout << "  warmup " << text.size() << " bytes: "
-                      << job_ms << "ms\n";
-        }
-        const auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - warmup_t0).count();
-        std::cout << "warmup done (" << warmup_ms << "ms)\n";
-    }
+
 #ifdef _WIN32
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup failed");
@@ -1774,12 +1714,6 @@ int run_http_server(const Args & args) {
     std::cout << "device: " << device_label(args.options);
     if (!args.device_set) std::cout << " (auto)";
     std::cout << "\n";
-    std::cout << "example request: POST /tts with JSON {\"text\":\"hello\",\"language\":\"EN\"}\n";
-    std::cout << "stream request: POST /tts/stream or POST /tts with {\"stream\":true}\n";
-    std::cout << "curl example: curl -X POST http://" << args.host << ":" << args.port
-              << "/tts -H \"Content-Type: application/json\" --data-raw \"{\\\"text\\\":\\\"hello\\\",\\\"language\\\":\\\"EN\\\"}\"\n";
-    std::cout << "curl stream: curl -N -X POST http://" << args.host << ":" << args.port
-              << "/tts/stream -H \"Content-Type: application/json\" --data-raw \"{\\\"text\\\":\\\"你好，这是流式测试。\\\",\\\"language\\\":\\\"ZH\\\"}\" --output output/stream.pcm\n";
     while (true) {
         SocketHandle client = accept(server, nullptr, nullptr);
         if (client == kInvalidSocket) continue;

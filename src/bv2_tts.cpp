@@ -2234,14 +2234,16 @@ Tensor bert_feature_from_input_ids(
 
     Tensor phone_bert({phone_count, kBertDim});
     int64_t out_t = 0;
+    const size_t kRowBytes = static_cast<size_t>(kBertDim) * sizeof(float);
     for (int64_t tok = 0; tok < tokens; ++tok) {
         const int64_t repeats = word2ph[static_cast<size_t>(tok)];
+        const float * src = &hidden.data[static_cast<size_t>(tok * kBertDim)];
         for (int64_t r = 0; r < repeats; ++r) {
             if (out_t >= phone_bert.shape[0]) break;
-            for (int64_t d = 0; d < kBertDim; ++d) {
-                phone_bert.data[static_cast<size_t>(out_t * kBertDim + d)] =
-                    hidden.data[static_cast<size_t>(tok * kBertDim + d)];
-            }
+            std::memcpy(
+                &phone_bert.data[static_cast<size_t>(out_t * kBertDim)],
+                src,
+                kRowBytes);
             ++out_t;
         }
     }
@@ -2400,25 +2402,7 @@ void preload_synthesis_model(
     const SynthesisOptions & options) {
 #ifdef BV2_WITH_MLX
     if (options.use_mlx) {
-        auto rt = cached_mlx_runtime(paths, options);
-        // Run a small dummy inference to pre-compile Metal shaders for a
-        // representative phone-sequence length.  The first real request then
-        // only pays the incremental cost of a different shape, not a full cold
-        // compilation.
-        if (rt && rt->is_loaded()) {
-            constexpr int kWarmupPhones = 20;
-            bv2::mlx_rt::MlxInferInputs dummy;
-            dummy.phones.assign(kWarmupPhones, 110);    // "SP" silence token
-            dummy.tones.assign(kWarmupPhones, 0);
-            dummy.languages.assign(kWarmupPhones, 0);   // ZH
-            dummy.bert_zh.assign(static_cast<size_t>(kWarmupPhones) * 1024, 0.0f);
-            dummy.bert_jp.assign(static_cast<size_t>(kWarmupPhones) * 1024, 0.0f);
-            dummy.bert_en.assign(static_cast<size_t>(kWarmupPhones) * 1024, 0.0f);
-            dummy.speaker_id = 0;
-            std::string warmup_err;
-            std::fprintf(stdout, "  (MLX shader warm-up...)\n");
-            rt->infer(dummy, &warmup_err);
-        }
+        (void)cached_mlx_runtime(paths, options);
         return;
     }
 #endif
@@ -2440,32 +2424,19 @@ void preload_bert_models(
     // pre-warm the MLX BertRuntime cache for each configured language so
     // the FIRST HTTP request doesn't pay the ~600 ms cold-load cost.
     if (options.use_mlx) {
-        auto try_preload = [&](const std::string & onnx_path,
-                               const char * label) {
+        auto try_preload = [&](const std::string & onnx_path) {
             if (onnx_path.empty()) return;
             try {
-                auto bert_rt = cached_mlx_bert(onnx_path, options);
-                // Warm up Metal shaders with a small dummy BERT forward pass.
-                if (bert_rt && bert_rt->is_loaded()) {
-                    constexpr int kN = 10;
-                    bv2::mlx_rt::BertInferInputs dummy;
-                    dummy.input_ids.assign(kN, 100);   // arbitrary valid token id
-                    dummy.token_type_ids.assign(kN, 0);
-                    dummy.word2ph.assign(kN, 1);       // 1 phone per token
-                    dummy.phone_count = kN;
-                    std::string warmup_err;
-                    bert_rt->infer(dummy, &warmup_err);
-                    std::fprintf(stdout, "  (MLX BERT %s shader warm-up done)\n", label);
-                }
+                (void)cached_mlx_bert(onnx_path, options);
             } catch (const std::exception & e) {
                 std::fprintf(stderr,
-                             "  [warn] MLX %s preload skipped: %s\n",
-                             label, e.what());
+                             "  [warn] MLX preload skipped: %s\n",
+                             e.what());
             }
         };
-        try_preload(paths.zh_model, "ZH");
-        try_preload(paths.jp_model, "JP");
-        try_preload(paths.en_model, "EN");
+        try_preload(paths.zh_model);
+        try_preload(paths.jp_model);
+        try_preload(paths.en_model);
         // Tokenisers are still ONNX-vocab files; load them so the first
         // request doesn't block on disk I/O.
         if (!paths.zh_vocab.empty()) {
